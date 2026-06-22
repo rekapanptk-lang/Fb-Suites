@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FB Sponsored Ads Link Scraper
 // @namespace    https://riko.local/fbscraper
-// @version      72.39.0
-// @description  v72.39.0 - Auto-update via GitHub. Inbox-only: random N komen (smm_inbox_quantity). Viral candidate: gas semua komen.
+// @version      72.40.0
+// @description  v72.40.0 - Auto-update via GitHub. Inbox-only: random N komen (smm_inbox_quantity). Viral candidate: gas semua komen.
 // @author       Riko
 // @updateURL    https://raw.githubusercontent.com/rekapanptk-lang/Fb-Suites/main/fb_scraper.user.js
 // @downloadURL  https://raw.githubusercontent.com/rekapanptk-lang/Fb-Suites/main/fb_scraper.user.js
@@ -34,6 +34,11 @@
     const ENDPOINT_URL = 'https://script.google.com/macros/s/AKfycbxe3mCNLCDfmEEwHpi4EKEAVTrAyoAewPIakY4F3ZQ0qNVhr3PBWWOfx5vNWLQ76YQGKQ/exec';
     const CONFIG_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
     const CONFIG_INITIAL_FETCH_RETRY_MS = [5000, 10000, 20000, 30000, 60000];
+
+    // v72.39.0 — Auto-update check GitHub
+    const GITHUB_RAW_URL = 'https://raw.githubusercontent.com/rekapanptk-lang/Fb-Suites/main/fb_scraper.user.js';
+    const TM_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;   // 6 jam
+    const TM_UPDATE_RELOAD_DELAY_MS   = 10 * 1000;            // 10 detik delay sebelum reload
 
     const TM_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '?.?.?';
 
@@ -494,9 +499,42 @@
 
     const LOG_RETENTION_MS = 30 * 60 * 1000;
     function addLog(msg, type) { type = type || 'info'; const time = new Date().toLocaleTimeString('id-ID', { hour12: false }); console.log('[FB Scraper ' + time + '] [' + type + '] ' + msg); markActivity(); }
+
+    // v72.39.0 — Check auto-update dari GitHub.
+    // Fetch URL raw → parse @version dari header → compare dengan TM_VERSION sekarang.
+    // Kalau beda → log + delay TM_UPDATE_RELOAD_DELAY_MS → location.reload().
+    // Reload trigger TM load script baru dari cache (kalau TM sudah update di background).
+    function checkScriptUpdateFromGithub() {
+        try {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: GITHUB_RAW_URL + '?t=' + Date.now(),   // cache buster
+                timeout: 15000,
+                onload: function(res) {
+                    if (!res || res.status !== 200 || !res.responseText) return;
+                    const txt = res.responseText.substring(0, 2000);
+                    const m = txt.match(/@version\s+([0-9A-Za-z.\-_]+)/);
+                    if (!m) return;
+                    const githubVersion = m[1].trim();
+                    if (!githubVersion || githubVersion === TM_VERSION) return;
+                    addLog('AutoUpdate: detect new version GitHub=' + githubVersion + ' (current=' + TM_VERSION + '), reload dalam ' + (TM_UPDATE_RELOAD_DELAY_MS / 1000) + 's...', 'success');
+                    setTimeout(function() {
+                        try { location.reload(); } catch (e) {}
+                    }, TM_UPDATE_RELOAD_DELAY_MS);
+                },
+                onerror: function() { /* silent */ },
+                ontimeout: function() { /* silent */ }
+            });
+        } catch (e) { /* silent */ }
+    }
+
     function logEvent(eventType) { const now = Date.now(); const time = new Date().toLocaleTimeString('id-ID', { hour12: false }); logMessages.unshift({ time, ts: now, eventType }); const cutoff = now - LOG_RETENTION_MS; while (logMessages.length > 0 && logMessages[logMessages.length - 1].ts < cutoff) logMessages.pop(); if (logMessages.length > MAX_LOG) logMessages.pop(); console.log('[FB Scraper ' + time + '] [event] ' + eventType); renderLogPanel(); markActivity(); }
     function pruneOldLogs() { const cutoff = Date.now() - LOG_RETENTION_MS; const before = logMessages.length; while (logMessages.length > 0 && logMessages[logMessages.length - 1].ts < cutoff) logMessages.pop(); if (logMessages.length !== before) renderLogPanel(); }
     setInterval(pruneOldLogs, 60000);
+
+    // v72.39.0 — Auto-update check tiap 6 jam (kick off first check 1 menit setelah load)
+    setTimeout(checkScriptUpdateFromGithub, 60 * 1000);
+    setInterval(checkScriptUpdateFromGithub, TM_UPDATE_CHECK_INTERVAL_MS);
 
     function renderLogPanel() { try { const logBox = document.getElementById('fbs-log-box'); if (!logBox) return; if (logMessages.length === 0) { logBox.innerHTML = '<div style="color:#666;font-size:9px;text-align:center;padding:8px;">(no events)</div>'; return; } const colors = { 'SCROLL': '#b0b3b8', 'CAPTURE LINK': '#1877f2', 'SUCCESS POST': '#42b72a', 'LINK DEDUP': '#ff77ff', 'KOMEN RELEVAN': '#9c27b0', 'KOMEN TERBARU': '#9c27b0', 'NOT FOUND': '#ffaa00', 'DAILY RESET 00:00 WIB': '#00d0d0', 'SCRAPER STARTED': '#42b72a', 'VIRAL SAVED': '#ff6b35', 'VIRAL DUP': '#ff77ff', 'SKIP LOW COUNT': '#ff6b6b', 'SKIP REEL': '#888888' }; const icons = { 'SCROLL': '\uD83D\uDCDC', 'CAPTURE LINK': '\uD83D\uDD17', 'SUCCESS POST': '\u2705', 'LINK DEDUP': '\uD83D\uDD01', 'KOMEN RELEVAN': '\u26D4', 'KOMEN TERBARU': '\u26D4', 'NOT FOUND': '\u274C', 'DAILY RESET 00:00 WIB': '\uD83D\uDD04', 'SCRAPER STARTED': '\uD83D\uDE80', 'VIRAL SAVED': '\uD83D\uDD25', 'VIRAL DUP': '\uD83D\uDD01', 'SKIP LOW COUNT': '\uD83D\uDCC9', 'SKIP REEL': '\uD83C\uDFAC' }; const html = logMessages.slice(0, 10).map(m => { const color = colors[m.eventType] || '#e4e6eb'; const icon = icons[m.eventType] || '\u2022'; return '<div style="display:flex;justify-content:space-between;font-size:9px;padding:2px 4px;border-bottom:1px solid #2d2f33;"><span style="color:' + color + ';">' + icon + ' ' + m.eventType + '</span><span style="color:#666;">' + m.time + '</span></div>'; }).join(''); logBox.innerHTML = html; } catch (e) {} }
 
