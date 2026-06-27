@@ -1,11 +1,9 @@
 // ==UserScript==
 // @name         FB Sponsored Ads Link Scraper
 // @namespace    https://riko.local/fbscraper
-// @version      72.40.0
-// @description  v72.40.0 - Auto-update via GitHub. Inbox-only: random N komen (smm_inbox_quantity). Viral candidate: gas semua komen.
+// @version      72.38.6
+// @description  v72.38.6 - Ambil semua URL bersponsor (bukan hanya permalink). Reels tetap config-driven via include_reels. Reels eligible viral kalau ON + >=min_comment_viral.
 // @author       Riko
-// @updateURL    https://raw.githubusercontent.com/rekapanptk-lang/Fb-Suites/main/fb_scraper.user.js
-// @downloadURL  https://raw.githubusercontent.com/rekapanptk-lang/Fb-Suites/main/fb_scraper.user.js
 // @match        *://*.facebook.com/*
 // @match        *://*.messenger.com/*
 // @connect      script.google.com
@@ -14,7 +12,6 @@
 // @connect      api.all-uneed.com
 // @connect      pusatpanelsmm.com
 // @connect      buzzerpanel.id
-// @connect      raw.githubusercontent.com
 // @connect      web.facebook.com
 // @connect      www.facebook.com
 // @connect      m.facebook.com
@@ -34,11 +31,6 @@
     const ENDPOINT_URL = 'https://script.google.com/macros/s/AKfycbxe3mCNLCDfmEEwHpi4EKEAVTrAyoAewPIakY4F3ZQ0qNVhr3PBWWOfx5vNWLQ76YQGKQ/exec';
     const CONFIG_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
     const CONFIG_INITIAL_FETCH_RETRY_MS = [5000, 10000, 20000, 30000, 60000];
-
-    // v72.39.0 — Auto-update check GitHub
-    const GITHUB_RAW_URL = 'https://raw.githubusercontent.com/rekapanptk-lang/Fb-Suites/main/fb_scraper.user.js';
-    const TM_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;   // 6 jam
-    const TM_UPDATE_RELOAD_DELAY_MS   = 10 * 1000;            // 10 detik delay sebelum reload
 
     const TM_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '?.?.?';
 
@@ -102,7 +94,7 @@
 
     function navigateToFeedRecover(reason) {
         try {
-            console.error('[FB Scraper v72.39.0] navigateToFeedRecover called outside mainScript scope: ' + reason);
+            console.error('[FB Scraper v72.38.6] navigateToFeedRecover called outside mainScript scope: ' + reason);
         } catch (e) {}
     }
 
@@ -110,7 +102,7 @@
     function scheduleGlobalErrorReload(reason) {
         try {
             globalErrorCount++;
-            console.warn('[FB Scraper v72.39.0] WOULD REFRESH (global-error, disabled): ' + reason + ' (total: ' + globalErrorCount + ')');
+            console.warn('[FB Scraper v72.38.6] WOULD REFRESH (global-error, disabled): ' + reason + ' (total: ' + globalErrorCount + ')');
         } catch (e) {}
     }
 
@@ -162,13 +154,13 @@
                 reason === 'fb-error-after-scroll'
             );
             if (allowRefresh) {
-                console.warn('[FB Scraper v72.39.0] REFRESH AKTIF: ' + reason);
+                console.warn('[FB Scraper v72.38.6] REFRESH AKTIF: ' + reason);
                 addLog('REFRESH: ' + reason, 'error');
                 GM_setValue(NEED_RELOAD_AFTER_NAV_KEY, '1');
                 GM_setValue(AUTO_RESUME_KEY, '1');
                 window.location.href = FEED_URL_V16;
             } else {
-                console.error('[FB Scraper v72.39.0] WOULD REFRESH (disabled): ' + reason);
+                console.error('[FB Scraper v72.38.6] WOULD REFRESH (disabled): ' + reason);
                 addLog('WOULD REFRESH: ' + reason + ' (disabled, lanjut scroll)', 'error');
             }
         } catch (e) {}
@@ -222,13 +214,12 @@
     }
 
     function parseScraperConfig(config) {
-        const scraper = { min_comment_inbox: 100, min_comment_viral: 1000, include_reels: true, smm_inbox_quantity: 10 };
+        const scraper = { min_comment_inbox: 100, min_comment_viral: 1000, include_reels: true };
         if (config && typeof config.scraper === 'object') {
             const s = config.scraper;
             if (typeof s.min_comment_inbox === 'number' && s.min_comment_inbox >= 0) scraper.min_comment_inbox = s.min_comment_inbox;
             if (typeof s.min_comment_viral === 'number' && s.min_comment_viral >= 0) scraper.min_comment_viral = s.min_comment_viral;
             if (typeof s.include_reels === 'boolean') scraper.include_reels = s.include_reels;
-            if (typeof s.smm_inbox_quantity === 'number' && s.smm_inbox_quantity > 0) scraper.smm_inbox_quantity = s.smm_inbox_quantity;
         }
         return scraper;
     }
@@ -254,7 +245,7 @@
                 const commentPanels = RUNTIME_CONFIG.smm_panels.filter(p => p.function === 'comment').length;
                 const likePanels = RUNTIME_CONFIG.smm_panels.filter(p => p.function === 'like').length;
                 addLog('Config: loaded v' + (result.version || '?') + ' (komentar=' + RUNTIME_CONFIG.komentar.length + ', skip_kw=' + RUNTIME_CONFIG.skip_keywords.length + ', exclude=' + RUNTIME_CONFIG.exclude_advertisers.length + ', smm=' + RUNTIME_CONFIG.smm_panels.length + ' [comment=' + commentPanels + ', like=' + likePanels + '])', 'success');
-                addLog('Config: scraper: min_inbox=' + RUNTIME_CONFIG.scraper.min_comment_inbox + ' min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + ' qty_inbox=' + RUNTIME_CONFIG.scraper.smm_inbox_quantity, 'info');
+                addLog('Config: scraper: min_inbox=' + RUNTIME_CONFIG.scraper.min_comment_inbox + ' min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels, 'info');
                 updateUI();
                 return true;
             }
@@ -276,7 +267,7 @@
                     applyConfigToRuntime(result.config);
                     RUNTIME_CONFIG.last_fetch_ts = Date.now();
                     RUNTIME_CONFIG.last_fetch_status = 'ok';
-                    addLog('Config: refreshed (min_inbox=' + RUNTIME_CONFIG.scraper.min_comment_inbox + ' min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + ' qty_inbox=' + RUNTIME_CONFIG.scraper.smm_inbox_quantity + ')', 'info');
+                    addLog('Config: refreshed (min_inbox=' + RUNTIME_CONFIG.scraper.min_comment_inbox + ' min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + ')', 'info');
                     updateUI();
                 }
             } catch (e) {}
@@ -290,7 +281,7 @@
             applyConfigToRuntime(result.config);
             RUNTIME_CONFIG.last_fetch_ts = Date.now();
             RUNTIME_CONFIG.last_fetch_status = 'ok-force';
-            addLog('Config: force refreshed (min_inbox=' + RUNTIME_CONFIG.scraper.min_comment_inbox + ' min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + ' qty_inbox=' + RUNTIME_CONFIG.scraper.smm_inbox_quantity + ')', 'success');
+            addLog('Config: force refreshed (min_inbox=' + RUNTIME_CONFIG.scraper.min_comment_inbox + ' min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + ')', 'success');
             updateUI();
             return true;
         }
@@ -422,23 +413,7 @@
         }, 'Sheet.update');
     }
 
-    function getCommentsList(isViralCandidate) {
-        const all = RUNTIME_CONFIG.komentar.slice();
-        // Viral candidate (count >= min_viral) → gas semua komen aktif
-        if (isViralCandidate) return all;
-        // Inbox only (count < min_viral) → random N unik (N dari TM_Config smm_inbox_quantity, default 10)
-        const n = (RUNTIME_CONFIG.scraper && RUNTIME_CONFIG.scraper.smm_inbox_quantity) || 10;
-        if (all.length <= n) return all;   // pool < N → return semua yang ada
-        const result = [];
-        const used = new Set();
-        while (result.length < n) {
-            const idx = Math.floor(Math.random() * all.length);
-            if (used.has(idx)) continue;
-            used.add(idx);
-            result.push(all[idx]);
-        }
-        return result;
-    }
+    function getCommentsList() { return RUNTIME_CONFIG.komentar.slice(); }
 
     function buildAllActiveCombos() {
         const combos = [];
@@ -460,10 +435,8 @@
         return Object.assign({}, picked, { counter_used: counter, total_combos: combos.length });
     }
 
-    async function submitOrderToSMM(targetUrl, isViralCandidate) {
-        const comments = getCommentsList(isViralCandidate); if (comments.length < 5) { addLog('SMM: comments < 5, skip order', 'warning'); return { ok: false, reason: 'comments-insufficient' }; }
-        const mode = isViralCandidate ? 'VIRAL (gas semua=' + comments.length + ')' : 'INBOX (random=' + comments.length + ')';
-        addLog('SMM: pick mode ' + mode, 'info');
+    async function submitOrderToSMM(targetUrl) {
+        const comments = getCommentsList(); if (comments.length < 5) { addLog('SMM: comments < 5, skip order', 'warning'); return { ok: false, reason: 'comments-insufficient' }; }
         const combo = getSmmCombo(); if (!combo) { addLog('SMM: no active combos (comment panels)', 'warning'); return { ok: false, error: 'no-active-combos' }; }
         const panel = combo.panel; const serviceId = combo.serviceId; const provider = panel.provider; const providerCfg = SMM_PROVIDERS[provider];
         if (!providerCfg) return { ok: false, error: 'unknown-provider', smm_panel: combo.smm_panel_label };
@@ -499,42 +472,9 @@
 
     const LOG_RETENTION_MS = 30 * 60 * 1000;
     function addLog(msg, type) { type = type || 'info'; const time = new Date().toLocaleTimeString('id-ID', { hour12: false }); console.log('[FB Scraper ' + time + '] [' + type + '] ' + msg); markActivity(); }
-
-    // v72.39.0 — Check auto-update dari GitHub.
-    // Fetch URL raw → parse @version dari header → compare dengan TM_VERSION sekarang.
-    // Kalau beda → log + delay TM_UPDATE_RELOAD_DELAY_MS → location.reload().
-    // Reload trigger TM load script baru dari cache (kalau TM sudah update di background).
-    function checkScriptUpdateFromGithub() {
-        try {
-            GM_xmlhttpRequest({
-                method: 'GET',
-                url: GITHUB_RAW_URL + '?t=' + Date.now(),   // cache buster
-                timeout: 15000,
-                onload: function(res) {
-                    if (!res || res.status !== 200 || !res.responseText) return;
-                    const txt = res.responseText.substring(0, 2000);
-                    const m = txt.match(/@version\s+([0-9A-Za-z.\-_]+)/);
-                    if (!m) return;
-                    const githubVersion = m[1].trim();
-                    if (!githubVersion || githubVersion === TM_VERSION) return;
-                    addLog('AutoUpdate: detect new version GitHub=' + githubVersion + ' (current=' + TM_VERSION + '), reload dalam ' + (TM_UPDATE_RELOAD_DELAY_MS / 1000) + 's...', 'success');
-                    setTimeout(function() {
-                        try { location.reload(); } catch (e) {}
-                    }, TM_UPDATE_RELOAD_DELAY_MS);
-                },
-                onerror: function() { /* silent */ },
-                ontimeout: function() { /* silent */ }
-            });
-        } catch (e) { /* silent */ }
-    }
-
     function logEvent(eventType) { const now = Date.now(); const time = new Date().toLocaleTimeString('id-ID', { hour12: false }); logMessages.unshift({ time, ts: now, eventType }); const cutoff = now - LOG_RETENTION_MS; while (logMessages.length > 0 && logMessages[logMessages.length - 1].ts < cutoff) logMessages.pop(); if (logMessages.length > MAX_LOG) logMessages.pop(); console.log('[FB Scraper ' + time + '] [event] ' + eventType); renderLogPanel(); markActivity(); }
     function pruneOldLogs() { const cutoff = Date.now() - LOG_RETENTION_MS; const before = logMessages.length; while (logMessages.length > 0 && logMessages[logMessages.length - 1].ts < cutoff) logMessages.pop(); if (logMessages.length !== before) renderLogPanel(); }
     setInterval(pruneOldLogs, 60000);
-
-    // v72.39.0 — Auto-update check tiap 6 jam (kick off first check 1 menit setelah load)
-    setTimeout(checkScriptUpdateFromGithub, 60 * 1000);
-    setInterval(checkScriptUpdateFromGithub, TM_UPDATE_CHECK_INTERVAL_MS);
 
     function renderLogPanel() { try { const logBox = document.getElementById('fbs-log-box'); if (!logBox) return; if (logMessages.length === 0) { logBox.innerHTML = '<div style="color:#666;font-size:9px;text-align:center;padding:8px;">(no events)</div>'; return; } const colors = { 'SCROLL': '#b0b3b8', 'CAPTURE LINK': '#1877f2', 'SUCCESS POST': '#42b72a', 'LINK DEDUP': '#ff77ff', 'KOMEN RELEVAN': '#9c27b0', 'KOMEN TERBARU': '#9c27b0', 'NOT FOUND': '#ffaa00', 'DAILY RESET 00:00 WIB': '#00d0d0', 'SCRAPER STARTED': '#42b72a', 'VIRAL SAVED': '#ff6b35', 'VIRAL DUP': '#ff77ff', 'SKIP LOW COUNT': '#ff6b6b', 'SKIP REEL': '#888888' }; const icons = { 'SCROLL': '\uD83D\uDCDC', 'CAPTURE LINK': '\uD83D\uDD17', 'SUCCESS POST': '\u2705', 'LINK DEDUP': '\uD83D\uDD01', 'KOMEN RELEVAN': '\u26D4', 'KOMEN TERBARU': '\u26D4', 'NOT FOUND': '\u274C', 'DAILY RESET 00:00 WIB': '\uD83D\uDD04', 'SCRAPER STARTED': '\uD83D\uDE80', 'VIRAL SAVED': '\uD83D\uDD25', 'VIRAL DUP': '\uD83D\uDD01', 'SKIP LOW COUNT': '\uD83D\uDCC9', 'SKIP REEL': '\uD83C\uDFAC' }; const html = logMessages.slice(0, 10).map(m => { const color = colors[m.eventType] || '#e4e6eb'; const icon = icons[m.eventType] || '\u2022'; return '<div style="display:flex;justify-content:space-between;font-size:9px;padding:2px 4px;border-bottom:1px solid #2d2f33;"><span style="color:' + color + ';">' + icon + ' ' + m.eventType + '</span><span style="color:#666;">' + m.time + '</span></div>'; }).join(''); logBox.innerHTML = html; } catch (e) {} }
 
@@ -885,9 +825,9 @@
             } else { post.style.outline = '3px dashed #ffaa00'; addLog('Post: SHEET-ERROR (' + (sheetResult.reason || 'unknown') + ') "' + advertiser + '"', 'warning'); }
 
             if (shouldOrderSmm) {
-                const comments = getCommentsList(isViralCandidate);
+                const comments = getCommentsList();
                 if (comments.length < 5) { addLog('SMM: comments < 5, skip order', 'warning'); }
-                else { await sleep(800); const orderResult = await submitOrderToSMM(cleanedUrl, isViralCandidate); if (orderResult.ok) { await updateSheetStatus(sheetResult.row, 'Proses', orderResult.order_id, '', orderResult.smm_panel); addLog('Order: "' + advertiser + '" #' + orderResult.order_id + ' (' + orderResult.smm_panel + ')', 'success'); } else { await updateSheetStatus(sheetResult.row, 'Gagal', '', orderResult.error || 'unknown', orderResult.smm_panel); addLog('Order: "' + advertiser + '" failed: ' + orderResult.error, 'error'); } }
+                else { await sleep(800); const orderResult = await submitOrderToSMM(cleanedUrl); if (orderResult.ok) { await updateSheetStatus(sheetResult.row, 'Proses', orderResult.order_id, '', orderResult.smm_panel); addLog('Order: "' + advertiser + '" #' + orderResult.order_id + ' (' + orderResult.smm_panel + ')', 'success'); } else { await updateSheetStatus(sheetResult.row, 'Gagal', '', orderResult.error || 'unknown', orderResult.smm_panel); addLog('Order: "' + advertiser + '" failed: ' + orderResult.error, 'error'); } }
             }
 
             if (isViralCandidate && sheetResult.ok && sheetResult.status === 'new') {
@@ -917,7 +857,7 @@
         if (mainLoopRunning) { addLog('Main: already running, ignore start', 'warning'); return; }
         if (!RUNTIME_CONFIG.loaded) { addLog('Main: config not loaded yet, cannot start', 'error'); return; }
         mainLoopRunning = true; shouldStop = false; isPaused = false; lastExtractedUrl = null;
-        try { const navigated = await ensureOnFeedPage(); if (navigated) { mainLoopRunning = false; return; } await waitPageFullyLoaded(); addLog('Main: FEED loop active (min_inbox=' + RUNTIME_CONFIG.scraper.min_comment_inbox + ' min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + ' qty_inbox=' + RUNTIME_CONFIG.scraper.smm_inbox_quantity + ')', 'success'); } catch (e) { addLog('Main: FEED ensure error: ' + e.message, 'warning'); }
+        try { const navigated = await ensureOnFeedPage(); if (navigated) { mainLoopRunning = false; return; } await waitPageFullyLoaded(); addLog('Main: FEED loop active (min_inbox=' + RUNTIME_CONFIG.scraper.min_comment_inbox + ' min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + ')', 'success'); } catch (e) { addLog('Main: FEED ensure error: ' + e.message, 'warning'); }
         startWatchdog(); startHeartbeatWatchdog(); startWebWorkerHeartbeat(); updateUI();
         let stuckCount = 0;
         try {
@@ -943,7 +883,7 @@
         const existing = document.getElementById('fb-scraper-panel'); if (existing) existing.remove();
         const panel = document.createElement('div'); panel.id = 'fb-scraper-panel';
         panel.innerHTML = '<style>#fb-scraper-panel { position: fixed !important; top: 80px !important; right: 15px !important; width: 280px !important; background: #1c1e21 !important; color: #e4e6eb !important; font-family: -apple-system, BlinkMacSystemFont, sans-serif !important; font-size: 13px !important; border-radius: 10px !important; box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important; z-index: 2147483647 !important; border: 1px solid #3a3b3c !important; max-height: calc(100vh - 100px) !important; display: flex !important; flex-direction: column !important; overflow: hidden !important; } #fb-scraper-panel.minimized { width: 160px !important; max-height: none !important; } #fb-scraper-panel .fbs-header { background: linear-gradient(135deg, #42b72a, #2d8a1c); padding: 10px 12px; cursor: move; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; } #fb-scraper-panel .fbs-title { font-weight: 700; color: white; font-size: 13px; } #fb-scraper-panel .fbs-mini-btn { background: rgba(255,255,255,0.2); border: none; color: white; width: 22px; height: 22px; border-radius: 4px; cursor: pointer; } #fb-scraper-panel .fbs-body { padding: 12px; overflow-y: auto; overflow-x: hidden; flex: 1 1 auto; min-height: 0; } #fb-scraper-panel.minimized .fbs-body { display: none; } #fb-scraper-panel .fbs-saved-box { text-align: center; padding: 14px 10px; background: #2d2f33; border-radius: 8px; margin-bottom: 10px; } #fb-scraper-panel .fbs-saved-num { font-size: 32px; font-weight: 700; color: #42b72a; line-height: 1; } #fb-scraper-panel .fbs-saved-label { font-size: 10px; color: #b0b3b8; margin-top: 4px; text-transform: uppercase; } #fb-scraper-panel .fbs-stats-row { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 6px; font-size: 9px; text-align: center; } #fb-scraper-panel .fbs-stat-cell { background: #141618; padding: 4px; border-radius: 4px; } #fb-scraper-panel .fbs-stat-cell .num { font-weight: 700; font-size: 12px; color: #42b72a; } #fb-scraper-panel .fbs-stat-cell .lbl { color: #b0b3b8; font-size: 8px; } #fb-scraper-panel .fbs-btn { width: 100%; padding: 10px; border: none; border-radius: 6px; cursor: pointer; font-weight: 700; font-size: 13px; margin-bottom: 6px; } #fb-scraper-panel .fbs-btn-start { background: #42b72a; color: white; } #fb-scraper-panel .fbs-btn-start:disabled { background: #555; cursor: not-allowed; opacity: 0.6; } #fb-scraper-panel .fbs-btn-stop { background: #e41e3f; color: white; } #fb-scraper-panel .fbs-btn-pause { background: #ffaa00; color: black; } #fb-scraper-panel .fbs-btn-play { background: #1877f2; color: white; } #fb-scraper-panel .fbs-btn-clear { background: #3a3b3c; color: #b0b3b8; font-size: 11px; } #fb-scraper-panel .fbs-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; } #fb-scraper-panel .fbs-row .fbs-btn { margin-bottom: 0; } #fb-scraper-panel .fbs-toast { position: fixed; bottom: 20px; right: 20px; background: #42b72a; color: white; padding: 10px 16px; border-radius: 6px; font-weight: 600; z-index: 2147483647; }</style>' +
-        '<div class="fbs-header" id="fbs-header"><span class="fbs-title">FB Scraper v72.39.0</span><button class="fbs-mini-btn" id="fbs-minimize">_</button></div>' +
+        '<div class="fbs-header" id="fbs-header"><span class="fbs-title">FB Scraper v72.38.6</span><button class="fbs-mini-btn" id="fbs-minimize">_</button></div>' +
         '<div class="fbs-body">' +
         '<div class="fbs-saved-box"><div class="fbs-saved-num" id="fbs-stat-count">0</div><div class="fbs-saved-label">Link Inbox Tersimpan</div></div>' +
         '<div class="fbs-stats-row"><div class="fbs-stat-cell"><div class="num" id="fbs-stat-detected" style="color:#42b72a;">0</div><div class="lbl">Detected</div></div><div class="fbs-stat-cell"><div class="num" id="fbs-stat-dup" style="color:#ff77ff;">0</div><div class="lbl">Inbox Dup</div></div></div>' +
@@ -969,7 +909,7 @@
     function wirePanelEvents(panel) {
         document.getElementById('fbs-minimize').addEventListener('click', e => { e.stopPropagation(); panel.classList.toggle('minimized'); });
         document.getElementById('fbs-config-refresh').addEventListener('click', async () => { await forceRefreshConfig(); });
-        document.getElementById('fbs-btn-toggle').addEventListener('click', () => { if (mainLoopRunning) return; if (!RUNTIME_CONFIG.loaded) { alert('Config belum loaded.'); return; } const akunFb = (GM_getValue(AKUN_FB_KEY, '') || '').trim(); if (!akunFb) { alert('Nama Akun FB belum diisi!'); return; } const commentsList = getCommentsList(true); if (commentsList.length < 5) { alert('Komentar di sheet kurang dari 5!'); return; } mainLoop(); });
+        document.getElementById('fbs-btn-toggle').addEventListener('click', () => { if (mainLoopRunning) return; if (!RUNTIME_CONFIG.loaded) { alert('Config belum loaded.'); return; } const akunFb = (GM_getValue(AKUN_FB_KEY, '') || '').trim(); if (!akunFb) { alert('Nama Akun FB belum diisi!'); return; } const commentsList = getCommentsList(); if (commentsList.length < 5) { alert('Komentar di sheet kurang dari 5!'); return; } mainLoop(); });
         document.getElementById('fbs-btn-stop').addEventListener('click', () => { if (!mainLoopRunning) return; stopMainLoop(); });
         document.getElementById('fbs-btn-pause').addEventListener('click', () => togglePause());
         document.getElementById('fbs-btn-clear').addEventListener('click', () => { if (confirm('Hapus ' + collectedLinks.length + ' link?')) { clearLinks(); logMessages = []; detectedCount = 0; scrollAttempts = 0; skippedNoCTA = 0; skippedExcluded = 0; skippedKeyword = 0; skippedDuplicate = 0; skippedBelowMinComment = 0; skippedReels = 0; viralSavedCount = 0; viralDupCount = 0; linksSinceLastDelay = 0; retryCount = 0; errorRecoveryCount = 0; lastExtractedUrl = null; document.querySelectorAll('[data-fb-extracted], [data-fb-processing]').forEach(el => { el.removeAttribute('data-fb-extracted'); el.removeAttribute('data-fb-processing'); el.style.outline = ''; }); addLog('UI: cleared all stats + markers', 'info'); updateUI(); } });
@@ -1004,7 +944,7 @@
             const viralSaved = document.getElementById('fbs-stat-viral-saved'); const viralDup = document.getElementById('fbs-stat-viral-dup'); if (viralSaved) viralSaved.textContent = viralSavedCount; if (viralDup) viralDup.textContent = viralDupCount;
             const skipLow = document.getElementById('fbs-stat-skip-low'); const skipReel = document.getElementById('fbs-stat-skip-reel'); if (skipLow) skipLow.textContent = skippedBelowMinComment; if (skipReel) skipReel.textContent = skippedReels;
             const configStatus = document.getElementById('fbs-config-status');
-            if (configStatus) { if (!RUNTIME_CONFIG.loaded) { configStatus.innerHTML = '<span style="color:#ff6b6b;">' + RUNTIME_CONFIG.last_fetch_status + '</span>'; } else { const elapsed = Math.floor((Date.now() - RUNTIME_CONFIG.last_fetch_ts) / 1000); const commentPanels = RUNTIME_CONFIG.smm_panels.filter(p => p.function === 'comment').length; const likePanels = RUNTIME_CONFIG.smm_panels.filter(p => p.function === 'like').length; configStatus.innerHTML = '<div style="color:#42b72a;">' + RUNTIME_CONFIG.komentar.length + ' komen | ' + RUNTIME_CONFIG.skip_keywords.length + ' skip | ' + RUNTIME_CONFIG.exclude_advertisers.length + ' excl</div><div style="color:#42b72a;">SMM: ' + commentPanels + ' comment | ' + likePanels + ' like</div><div style="color:#1877f2;">min_inbox=' + RUNTIME_CONFIG.scraper.min_comment_inbox + ' min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + ' qty=' + RUNTIME_CONFIG.scraper.smm_inbox_quantity + '</div><div style="color:#666;font-size:8px;">fetched ' + elapsed + 's ago</div>'; } }
+            if (configStatus) { if (!RUNTIME_CONFIG.loaded) { configStatus.innerHTML = '<span style="color:#ff6b6b;">' + RUNTIME_CONFIG.last_fetch_status + '</span>'; } else { const elapsed = Math.floor((Date.now() - RUNTIME_CONFIG.last_fetch_ts) / 1000); const commentPanels = RUNTIME_CONFIG.smm_panels.filter(p => p.function === 'comment').length; const likePanels = RUNTIME_CONFIG.smm_panels.filter(p => p.function === 'like').length; configStatus.innerHTML = '<div style="color:#42b72a;">' + RUNTIME_CONFIG.komentar.length + ' komen | ' + RUNTIME_CONFIG.skip_keywords.length + ' skip | ' + RUNTIME_CONFIG.exclude_advertisers.length + ' excl</div><div style="color:#42b72a;">SMM: ' + commentPanels + ' comment | ' + likePanels + ' like</div><div style="color:#1877f2;">min_inbox=' + RUNTIME_CONFIG.scraper.min_comment_inbox + ' min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + '</div><div style="color:#666;font-size:8px;">fetched ' + elapsed + 's ago</div>'; } }
             if (btnStart && btnRow) { if (mainLoopRunning) { btnStart.style.display = 'none'; btnRow.style.display = 'grid'; } else { btnStart.style.display = 'block'; btnRow.style.display = 'none'; if (!RUNTIME_CONFIG.loaded) { btnStart.textContent = 'WAITING CONFIG...'; btnStart.disabled = true; } else if (RUNTIME_CONFIG.komentar.length < 5) { btnStart.textContent = 'KOMEN < 5'; btnStart.disabled = true; } else { btnStart.textContent = 'START'; btnStart.disabled = false; } } }
             if (btnPause) { if (isPaused) { btnPause.textContent = 'PLAY'; btnPause.className = 'fbs-btn fbs-btn-play'; } else { btnPause.textContent = 'PAUSE'; btnPause.className = 'fbs-btn fbs-btn-pause'; } }
             const modeStatus = document.getElementById('fbs-mode-status'); if (modeStatus) { if (!mainLoopRunning) { modeStatus.textContent = 'FEED idle'; modeStatus.style.color = '#42b72a'; } else if (isPaused) { modeStatus.textContent = 'PAUSED'; modeStatus.style.color = '#ffaa00'; } else { modeStatus.textContent = 'RUNNING'; modeStatus.style.color = '#42b72a'; } }
