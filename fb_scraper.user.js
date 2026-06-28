@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FB Sponsored Ads Link Scraper
 // @namespace    https://riko.local/fbscraper
-// @version      72.38.6
-// @description  v72.38.6 - Ambil semua URL bersponsor (bukan hanya permalink). Reels tetap config-driven via include_reels. Reels eligible viral kalau ON + >=min_comment_viral.
+// @version      73.2.0
+// @description  v73.2.0 - SMM multi-service retry per akun: kalau service A gagal, try service B di akun yang sama; "Saldo tidak cukup" / "API Key salah" → fallback ke akun lain. v73.1.0 = filter min_comment_inbox/belumAda/timeout-no-count DIHAPUS + SMM order ambil urut #1-N. v73.0.0 = SMM order quantity logic. v72.39.x = simplified keyword check + permalink.php hardening.
 // @author       Riko
 // @match        *://*.facebook.com/*
 // @match        *://*.messenger.com/*
@@ -94,7 +94,7 @@
 
     function navigateToFeedRecover(reason) {
         try {
-            console.error('[FB Scraper v72.38.6] navigateToFeedRecover called outside mainScript scope: ' + reason);
+            console.error('[FB Scraper v73.2.0] navigateToFeedRecover called outside mainScript scope: ' + reason);
         } catch (e) {}
     }
 
@@ -102,7 +102,7 @@
     function scheduleGlobalErrorReload(reason) {
         try {
             globalErrorCount++;
-            console.warn('[FB Scraper v72.38.6] WOULD REFRESH (global-error, disabled): ' + reason + ' (total: ' + globalErrorCount + ')');
+            console.warn('[FB Scraper v73.2.0] WOULD REFRESH (global-error, disabled): ' + reason + ' (total: ' + globalErrorCount + ')');
         } catch (e) {}
     }
 
@@ -132,10 +132,6 @@
 
     const SMM_RR_GLOBAL_COUNTER_KEY = 'fb_scraper_smm_rr_global_counter_v72_29';
     const COMMENT_MODAL_READINESS_POLL_MS = 500;
-    const COMMENT_MODAL_READINESS_TIMEOUT_MS = 15000;
-    const COMMENT_SORT_SWITCH_WAIT_MS = 8000;
-    const COMMENT_PAGEDOWN_COUNT = 1;
-    const COMMENT_PAGEDOWN_WAIT_MS = 1500;
     const PANEL_ZOOM_MIN = 0.5;
     const PANEL_ZOOM_MAX = 2.5;
     const PANEL_ZOOM_STEP = 0.1;
@@ -144,7 +140,9 @@
     const HEARTBEAT_TIMEOUT_MS = 180 * 1000;
     const WORKER_PING_INTERVAL_MS = 5000;
     const PAGE_FULL_LOAD_WAIT_MS = 8000;
-    const KEYWORD_RELEVAN_DELAY_MS = 10000;
+
+    // v72.39.0: Delay tunggu articles muncul di dialog setelah modal ready
+    const ARTICLE_SCAN_WAIT_MS = 3000;
 
     function navigateToFeedRecover(reason) {
         try {
@@ -154,13 +152,13 @@
                 reason === 'fb-error-after-scroll'
             );
             if (allowRefresh) {
-                console.warn('[FB Scraper v72.38.6] REFRESH AKTIF: ' + reason);
+                console.warn('[FB Scraper v73.2.0] REFRESH AKTIF: ' + reason);
                 addLog('REFRESH: ' + reason, 'error');
                 GM_setValue(NEED_RELOAD_AFTER_NAV_KEY, '1');
                 GM_setValue(AUTO_RESUME_KEY, '1');
                 window.location.href = FEED_URL_V16;
             } else {
-                console.error('[FB Scraper v72.38.6] WOULD REFRESH (disabled): ' + reason);
+                console.error('[FB Scraper v73.2.0] WOULD REFRESH (disabled): ' + reason);
                 addLog('WOULD REFRESH: ' + reason + ' (disabled, lanjut scroll)', 'error');
             }
         } catch (e) {}
@@ -187,7 +185,7 @@
 
     let RUNTIME_CONFIG = {
         komentar: [], skip_keywords: [], exclude_advertisers: [], smm_panels: [],
-        scraper: { min_comment_inbox: 100, min_comment_viral: 1000, include_reels: true },
+        scraper: { min_comment_inbox: 0, min_comment_viral: 1000, include_reels: true, smm_inbox_quantity: 10 },
         loaded: false, last_fetch_ts: 0, last_fetch_status: 'not-fetched'
     };
 
@@ -214,12 +212,14 @@
     }
 
     function parseScraperConfig(config) {
-        const scraper = { min_comment_inbox: 100, min_comment_viral: 1000, include_reels: true };
+        const scraper = { min_comment_inbox: 0, min_comment_viral: 1000, include_reels: true, smm_inbox_quantity: 10 };
         if (config && typeof config.scraper === 'object') {
             const s = config.scraper;
             if (typeof s.min_comment_inbox === 'number' && s.min_comment_inbox >= 0) scraper.min_comment_inbox = s.min_comment_inbox;
             if (typeof s.min_comment_viral === 'number' && s.min_comment_viral >= 0) scraper.min_comment_viral = s.min_comment_viral;
             if (typeof s.include_reels === 'boolean') scraper.include_reels = s.include_reels;
+            // v73.0.0: smm_inbox_quantity untuk single-write (inbox only) order quantity
+            if (typeof s.smm_inbox_quantity === 'number' && s.smm_inbox_quantity >= 1) scraper.smm_inbox_quantity = s.smm_inbox_quantity;
         }
         return scraper;
     }
@@ -245,7 +245,7 @@
                 const commentPanels = RUNTIME_CONFIG.smm_panels.filter(p => p.function === 'comment').length;
                 const likePanels = RUNTIME_CONFIG.smm_panels.filter(p => p.function === 'like').length;
                 addLog('Config: loaded v' + (result.version || '?') + ' (komentar=' + RUNTIME_CONFIG.komentar.length + ', skip_kw=' + RUNTIME_CONFIG.skip_keywords.length + ', exclude=' + RUNTIME_CONFIG.exclude_advertisers.length + ', smm=' + RUNTIME_CONFIG.smm_panels.length + ' [comment=' + commentPanels + ', like=' + likePanels + '])', 'success');
-                addLog('Config: scraper: min_inbox=' + RUNTIME_CONFIG.scraper.min_comment_inbox + ' min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels, 'info');
+                addLog('Config: scraper: min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels, 'info');
                 updateUI();
                 return true;
             }
@@ -267,7 +267,7 @@
                     applyConfigToRuntime(result.config);
                     RUNTIME_CONFIG.last_fetch_ts = Date.now();
                     RUNTIME_CONFIG.last_fetch_status = 'ok';
-                    addLog('Config: refreshed (min_inbox=' + RUNTIME_CONFIG.scraper.min_comment_inbox + ' min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + ')', 'info');
+                    addLog('Config: refreshed (min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + ')', 'info');
                     updateUI();
                 }
             } catch (e) {}
@@ -281,7 +281,7 @@
             applyConfigToRuntime(result.config);
             RUNTIME_CONFIG.last_fetch_ts = Date.now();
             RUNTIME_CONFIG.last_fetch_status = 'ok-force';
-            addLog('Config: force refreshed (min_inbox=' + RUNTIME_CONFIG.scraper.min_comment_inbox + ' min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + ')', 'success');
+            addLog('Config: force refreshed (min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + ')', 'success');
             updateUI();
             return true;
         }
@@ -299,7 +299,6 @@
     let skippedExcluded = 0;
     let skippedKeyword = 0;
     let skippedDuplicate = 0;
-    let skippedBelowMinComment = 0;
     let skippedReels = 0;
     let viralSavedCount = 0;
     let viralDupCount = 0;
@@ -328,22 +327,6 @@
         }, WATCHDOG_CHECK_INTERVAL_MS);
     }
     function stopWatchdog() { if (watchdogIntervalId) { clearInterval(watchdogIntervalId); watchdogIntervalId = null; } }
-
-    function isInMainFeed(post) {
-        if (!post) return false;
-        let el = post;
-        for (let i = 0; i < 30 && el && el !== document.body; i++) {
-            if (el.getAttribute) { const role = el.getAttribute('role'); if (role === 'complementary') return false;
-                const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase(); if (ariaLabel === 'kontak' || ariaLabel === 'contacts') return false; }
-            el = el.parentElement;
-        }
-        el = post;
-        for (let i = 0; i < 30 && el && el !== document.body; i++) {
-            if (el.getAttribute) { const pagelet = el.getAttribute('data-pagelet') || ''; if (pagelet.includes('FeedUnit') || pagelet.includes('MainFeed')) return true; }
-            el = el.parentElement;
-        }
-        const rect = post.getBoundingClientRect(); if (rect.width < 400) return false; return true;
-    }
 
     function loadLinks() { try { return JSON.parse(GM_getValue(STORAGE_KEY, '[]')) || []; } catch (e) { return []; } }
     function saveLinks() { try { GM_setValue(STORAGE_KEY, JSON.stringify(collectedLinks)); } catch (e) {} }
@@ -415,48 +398,236 @@
 
     function getCommentsList() { return RUNTIME_CONFIG.komentar.slice(); }
 
-    function buildAllActiveCombos() {
-        const combos = [];
+    // v73.2.0: Build accounts grouped by panel (not flat combos)
+    // Returns: [{ panel, services: [id1, id2, ...], label_prefix }, ...]
+    // Order of accounts preserved from RUNTIME_CONFIG.smm_panels.
+    // Order of services within account preserved (#1,#2,#3,... for fallback order).
+    function buildActiveAccounts() {
+        const accounts = [];
         for (const panel of RUNTIME_CONFIG.smm_panels) {
-            if (!panel.enabled || !panel.label) continue; if (panel.function !== 'comment') continue;
-            const providerCfg = SMM_PROVIDERS[panel.provider]; if (!providerCfg) continue;
-            let valid = true; for (const field of providerCfg.requiredFields) if (!panel[field]) { valid = false; break; } if (!valid) continue;
+            if (!panel.enabled || !panel.label) continue;
+            if (panel.function !== 'comment') continue;
+            const providerCfg = SMM_PROVIDERS[panel.provider];
+            if (!providerCfg) continue;
+            let valid = true;
+            for (const field of providerCfg.requiredFields) if (!panel[field]) { valid = false; break; }
+            if (!valid) continue;
             if (!Array.isArray(panel.services)) continue;
-            for (const svc of panel.services) { if (!svc.enabled || !svc.id) continue; combos.push({ panel: panel, serviceId: svc.id, smm_panel_label: panel.label + ' ' + svc.id }); }
+            const services = [];
+            for (const svc of panel.services) {
+                if (!svc.enabled || !svc.id) continue;
+                services.push(svc.id);
+            }
+            if (services.length === 0) continue;
+            accounts.push({ panel: panel, services: services, label_prefix: panel.label });
         }
-        return combos;
+        return accounts;
     }
 
-    function getSmmCombo() {
-        const combos = buildAllActiveCombos(); if (combos.length === 0) return null;
-        let counter = parseInt(GM_getValue(SMM_RR_GLOBAL_COUNTER_KEY, '0'), 10); if (isNaN(counter) || counter < 0) counter = 0;
-        const idx = counter % combos.length; const picked = combos[idx];
-        try { GM_setValue(SMM_RR_GLOBAL_COUNTER_KEY, String(counter + 1)); } catch (e) {}
-        return Object.assign({}, picked, { counter_used: counter, total_combos: combos.length });
+    // v73.2.0: Pick 1 account by round-robin (counter-based)
+    // Counter advance handled SEPARATELY after order complete (see submitOrderToSMM)
+    function getSmmAccountByIndex(index) {
+        const accounts = buildActiveAccounts();
+        if (accounts.length === 0) return null;
+        const idx = ((index % accounts.length) + accounts.length) % accounts.length;
+        return Object.assign({}, accounts[idx], { account_index: idx, total_accounts: accounts.length });
     }
 
-    async function submitOrderToSMM(targetUrl) {
-        const comments = getCommentsList(); if (comments.length < 5) { addLog('SMM: comments < 5, skip order', 'warning'); return { ok: false, reason: 'comments-insufficient' }; }
-        const combo = getSmmCombo(); if (!combo) { addLog('SMM: no active combos (comment panels)', 'warning'); return { ok: false, error: 'no-active-combos' }; }
-        const panel = combo.panel; const serviceId = combo.serviceId; const provider = panel.provider; const providerCfg = SMM_PROVIDERS[provider];
-        if (!providerCfg) return { ok: false, error: 'unknown-provider', smm_panel: combo.smm_panel_label };
+    function getCurrentSmmCounter() {
+        let counter = parseInt(GM_getValue(SMM_RR_GLOBAL_COUNTER_KEY, '0'), 10);
+        if (isNaN(counter) || counter < 0) counter = 0;
+        return counter;
+    }
+
+    function advanceSmmCounter(by) {
+        try {
+            const cur = getCurrentSmmCounter();
+            GM_setValue(SMM_RR_GLOBAL_COUNTER_KEY, String(cur + (by || 1)));
+        } catch (e) {}
+    }
+
+    // v73.2.0: Detect "saldo habis" / "API key salah" error → skip whole account
+    // Sumber error message: BuzzerPanel docs (PPI/AUN belum lengkap)
+    function isAccountLevelError(errorMsg) {
+        if (!errorMsg) return false;
+        const lower = errorMsg.toString().toLowerCase();
+        return lower.includes('saldo tidak cukup')
+            || lower.includes('insufficient balance')
+            || lower.includes('insufficient')
+            || lower.includes('api key salah')
+            || lower.includes('invalid api')
+            || lower.includes('api key invalid');
+    }
+
+    // v73.2.0: Helper — try ONE service order, return result
+    // Tidak handle retry logic, hanya 1 attempt (apiCallWithRetry handle network retry internally)
+    async function trySingleSmmOrder(account, serviceId, targetUrl, comments, modeLabel) {
+        const panel = account.panel;
+        const provider = panel.provider;
+        const providerCfg = SMM_PROVIDERS[provider];
+        const smmLabel = account.label_prefix + ' ' + serviceId;
+        if (!providerCfg) return { ok: false, error: 'unknown-provider', smm_panel: smmLabel };
+
         let payload, requestBody, contentType;
-        if (provider === 'all-uneed') { payload = { api_id: panel.api_id, api_key: panel.api_key, service: serviceId, target: targetUrl, quantity: comments.length, comments: comments.join('\n') }; requestBody = JSON.stringify(payload); contentType = 'application/json'; }
-        else if (provider === 'ppi') { payload = { api_key: panel.api_key, secret_key: panel.secret_key, action: 'order', service: serviceId, data: targetUrl, quantity: comments.length, komen: comments.join('\n') }; const formParts = []; for (const [k, v] of Object.entries(payload)) formParts.push(encodeURIComponent(k) + '=' + encodeURIComponent(v)); requestBody = formParts.join('&'); contentType = 'application/x-www-form-urlencoded'; }
-        else if (provider === 'bp') { payload = { api_key: panel.api_key, secret_key: panel.secret_key, action: 'order', service: serviceId, data: targetUrl, quantity: comments.length, komen: comments.join('\n') }; requestBody = JSON.stringify(payload); contentType = 'application/json'; }
-        else { return { ok: false, smm_panel: combo.smm_panel_label }; }
-        addLog('SMM: "' + combo.smm_panel_label + '" [' + provider + '] (' + (combo.counter_used + 1) + '/' + combo.total_combos + '): POST ordering...', 'info');
-        const result = await apiCallWithRetry({ method: 'POST', url: providerCfg.api_url, data: requestBody, headers: { 'Content-Type': contentType },
+        if (provider === 'all-uneed') {
+            payload = { api_id: panel.api_id, api_key: panel.api_key, service: serviceId, target: targetUrl, quantity: comments.length, comments: comments.join('\n') };
+            requestBody = JSON.stringify(payload); contentType = 'application/json';
+        } else if (provider === 'ppi') {
+            payload = { api_key: panel.api_key, secret_key: panel.secret_key, action: 'order', service: serviceId, data: targetUrl, quantity: comments.length, komen: comments.join('\n') };
+            const formParts = []; for (const [k, v] of Object.entries(payload)) formParts.push(encodeURIComponent(k) + '=' + encodeURIComponent(v));
+            requestBody = formParts.join('&'); contentType = 'application/x-www-form-urlencoded';
+        } else if (provider === 'bp') {
+            payload = { api_key: panel.api_key, secret_key: panel.secret_key, action: 'order', service: serviceId, data: targetUrl, quantity: comments.length, komen: comments.join('\n') };
+            requestBody = JSON.stringify(payload); contentType = 'application/json';
+        } else {
+            return { ok: false, error: 'unsupported-provider', smm_panel: smmLabel };
+        }
+
+        const result = await apiCallWithRetry({
+            method: 'POST', url: providerCfg.api_url, data: requestBody, headers: { 'Content-Type': contentType },
             parseResponse: function(responseText) {
                 const parsed = JSON.parse(responseText); let isSuccess = false, orderId = null, errorMsg = '';
                 if (provider === 'all-uneed') { isSuccess = parsed.response === true; orderId = parsed.data && parsed.data.id; errorMsg = (parsed.data && parsed.data.msg) || 'unknown'; }
                 else if (provider === 'ppi' || provider === 'bp') { isSuccess = parsed.status === true; orderId = parsed.data && parsed.data.id; errorMsg = (parsed.data && parsed.data.msg) || 'unknown'; }
-                if (isSuccess && orderId) { addLog('SMM: "' + combo.smm_panel_label + '" Order #' + orderId, 'success'); return { ok: true, order_id: orderId, price: parsed.data && parsed.data.price, smm_panel: combo.smm_panel_label }; }
-                else { addLog('SMM: "' + combo.smm_panel_label + '" failed: ' + errorMsg, 'error'); return { ok: false, error: errorMsg, smm_panel: combo.smm_panel_label }; }
+                if (isSuccess && orderId) {
+                    return { ok: true, order_id: orderId, price: parsed.data && parsed.data.price, smm_panel: smmLabel };
+                } else {
+                    return { ok: false, error: errorMsg, smm_panel: smmLabel };
+                }
             }
-        }, 'SMM.order(' + combo.smm_panel_label + ')');
-        if (!result.smm_panel) result.smm_panel = combo.smm_panel_label;
+        }, 'SMM.order(' + smmLabel + ')');
+        if (!result.smm_panel) result.smm_panel = smmLabel;
         return result;
+    }
+
+    // v73.2.0: Multi-service retry per akun + fallback antar akun
+    // Flow:
+    //   1. Pick account by round-robin (counter advance HANYA setelah seluruh order selesai)
+    //   2. Try setiap service di akun itu (urut, dengan 500ms delay antar attempt)
+    //   3. Kalau "Saldo tidak cukup" / "API Key salah" → skip semua service di akun ini, fallback ke akun lain
+    //   4. Kalau semua service akun habis (non-account-level error) → fallback ke akun lain (counter +1)
+    //   5. Loop sampai sukses atau semua akun habis dicoba
+    async function submitOrderToSMM(targetUrl, isViralCandidate) {
+        const allComments = getCommentsList();
+        if (allComments.length < 5) { addLog('SMM: comments < 5, skip order', 'warning'); return { ok: false, reason: 'comments-insufficient' }; }
+
+        // v73.1.0: Pilih quantity berdasarkan mode (single-write vs dual-write)
+        let comments, modeLabel;
+        if (isViralCandidate === true) {
+            comments = allComments;
+            modeLabel = 'VIRAL ALL=' + comments.length;
+        } else {
+            const targetQty = RUNTIME_CONFIG.scraper.smm_inbox_quantity || 10;
+            const useQty = Math.min(targetQty, allComments.length);
+            comments = allComments.slice(0, useQty);
+            modeLabel = 'INBOX ' + useQty + '/' + allComments.length;
+        }
+
+        const accounts = buildActiveAccounts();
+        if (accounts.length === 0) { addLog('SMM: no active accounts (comment panels)', 'warning'); return { ok: false, error: 'no-active-accounts' }; }
+
+        const startCounter = getCurrentSmmCounter();
+        const failureReport = []; // untuk note kalau semua gagal: [{account, services: [{id, msg}], skipped_reason?}, ...]
+        let accountsTried = 0;
+        let counterAdvancedBy = 0; // berapa counter advance setelah semua selesai
+
+        // Loop accounts max sebanyak total accounts (try semua)
+        for (let attempt = 0; attempt < accounts.length; attempt++) {
+            const account = getSmmAccountByIndex(startCounter + attempt);
+            if (!account) break;
+            accountsTried++;
+
+            const accountFailures = []; // services yang gagal di akun ini
+            let accountSkipReason = null; // 'saldo' / 'apikey' kalau account-level error
+            let successResult = null;
+
+            addLog('SMM: round-robin pick ' + account.label_prefix + ' (account ' + (account.account_index + 1) + '/' + account.total_accounts + ', try-attempt ' + (attempt + 1) + ')', 'info');
+
+            // Loop services di account ini
+            for (let svcIdx = 0; svcIdx < account.services.length; svcIdx++) {
+                const serviceId = account.services[svcIdx];
+                const smmLabel = account.label_prefix + ' ' + serviceId;
+                addLog('SMM: try ' + smmLabel + ' (' + (svcIdx + 1) + '/' + account.services.length + ') [' + modeLabel + ']: POST ordering...', 'info');
+
+                const result = await trySingleSmmOrder(account, serviceId, targetUrl, comments, modeLabel);
+
+                if (result.ok) {
+                    addLog('SMM: ' + smmLabel + ' Order #' + result.order_id + ' [' + modeLabel + '] ✓', 'success');
+                    successResult = result;
+                    // Note enrichment: kalau ada gagal sebelumnya, sebutkan
+                    if (accountFailures.length > 0) {
+                        const failedIds = accountFailures.map(f => f.id).join(',');
+                        successResult.retry_note = 'Retry: ' + failedIds + ' failed @ ' + account.label_prefix;
+                        logEvent('SMM RETRY');
+                    } else if (failureReport.length > 0) {
+                        // Sukses tapi setelah fallback dari akun lain
+                        const failedAccountsStr = failureReport.map(r => r.account + (r.skipped_reason ? '(' + r.skipped_reason + ')' : '')).join(', ');
+                        successResult.retry_note = failedAccountsStr + ' → ' + account.label_prefix + ' OK';
+                        logEvent('SMM RETRY');
+                    }
+                    break; // exit service loop
+                }
+
+                addLog('SMM: ' + smmLabel + ' failed: ' + (result.error || 'unknown'), 'error');
+                accountFailures.push({ id: serviceId, msg: result.error || 'unknown' });
+
+                // Check account-level error → skip semua service di akun ini
+                if (isAccountLevelError(result.error)) {
+                    const isApiKey = (result.error || '').toLowerCase().includes('api key');
+                    accountSkipReason = isApiKey ? 'API Key salah' : 'saldo habis';
+                    addLog('SMM: ' + account.label_prefix + ' → ' + accountSkipReason + ' detected, SKIP all services in this account', 'warning');
+                    break; // exit service loop, fallback ke akun lain
+                }
+
+                // Delay 500ms antar service attempt (anti race + ga bombardir API)
+                if (svcIdx < account.services.length - 1) {
+                    await sleep(500);
+                }
+            }
+
+            // Counter advance +1 per akun yang dicoba (fair distribution antar akun)
+            counterAdvancedBy++;
+
+            if (successResult) {
+                // Final counter advance
+                advanceSmmCounter(counterAdvancedBy);
+                return successResult;
+            }
+
+            // Akun ini gagal, record ke failureReport
+            failureReport.push({
+                account: account.label_prefix,
+                services: accountFailures,
+                skipped_reason: accountSkipReason
+            });
+
+            // Delay 500ms sebelum coba akun berikutnya
+            if (attempt < accounts.length - 1) {
+                await sleep(500);
+            }
+        }
+
+        // Semua akun habis dicoba, semua gagal
+        advanceSmmCounter(counterAdvancedBy);
+        logEvent('SMM ALL FAIL');
+
+        // Build error note: "All failed: IRFAN(saldo habis), JOVIE(66996:Layanan tidak tersedia)"
+        const errorParts = failureReport.map(r => {
+            if (r.skipped_reason) return r.account + '(' + r.skipped_reason + ')';
+            const svcDetails = r.services.map(s => s.id + ':' + s.msg).join('|');
+            return r.account + '(' + svcDetails + ')';
+        });
+        const fullErrorMsg = 'All failed: ' + errorParts.join(', ');
+        addLog('SMM: ALL ATTEMPTS FAILED — ' + fullErrorMsg, 'error');
+
+        return {
+            ok: false,
+            error: fullErrorMsg,
+            smm_panel: '', // empty karena ga ada yang sukses
+            all_failed: true,
+            accounts_tried: accountsTried,
+            total_accounts: accounts.length
+        };
     }
 
     function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -476,11 +647,27 @@
     function pruneOldLogs() { const cutoff = Date.now() - LOG_RETENTION_MS; const before = logMessages.length; while (logMessages.length > 0 && logMessages[logMessages.length - 1].ts < cutoff) logMessages.pop(); if (logMessages.length !== before) renderLogPanel(); }
     setInterval(pruneOldLogs, 60000);
 
-    function renderLogPanel() { try { const logBox = document.getElementById('fbs-log-box'); if (!logBox) return; if (logMessages.length === 0) { logBox.innerHTML = '<div style="color:#666;font-size:9px;text-align:center;padding:8px;">(no events)</div>'; return; } const colors = { 'SCROLL': '#b0b3b8', 'CAPTURE LINK': '#1877f2', 'SUCCESS POST': '#42b72a', 'LINK DEDUP': '#ff77ff', 'KOMEN RELEVAN': '#9c27b0', 'KOMEN TERBARU': '#9c27b0', 'NOT FOUND': '#ffaa00', 'DAILY RESET 00:00 WIB': '#00d0d0', 'SCRAPER STARTED': '#42b72a', 'VIRAL SAVED': '#ff6b35', 'VIRAL DUP': '#ff77ff', 'SKIP LOW COUNT': '#ff6b6b', 'SKIP REEL': '#888888' }; const icons = { 'SCROLL': '\uD83D\uDCDC', 'CAPTURE LINK': '\uD83D\uDD17', 'SUCCESS POST': '\u2705', 'LINK DEDUP': '\uD83D\uDD01', 'KOMEN RELEVAN': '\u26D4', 'KOMEN TERBARU': '\u26D4', 'NOT FOUND': '\u274C', 'DAILY RESET 00:00 WIB': '\uD83D\uDD04', 'SCRAPER STARTED': '\uD83D\uDE80', 'VIRAL SAVED': '\uD83D\uDD25', 'VIRAL DUP': '\uD83D\uDD01', 'SKIP LOW COUNT': '\uD83D\uDCC9', 'SKIP REEL': '\uD83C\uDFAC' }; const html = logMessages.slice(0, 10).map(m => { const color = colors[m.eventType] || '#e4e6eb'; const icon = icons[m.eventType] || '\u2022'; return '<div style="display:flex;justify-content:space-between;font-size:9px;padding:2px 4px;border-bottom:1px solid #2d2f33;"><span style="color:' + color + ';">' + icon + ' ' + m.eventType + '</span><span style="color:#666;">' + m.time + '</span></div>'; }).join(''); logBox.innerHTML = html; } catch (e) {} }
+    function renderLogPanel() { try { const logBox = document.getElementById('fbs-log-box'); if (!logBox) return; if (logMessages.length === 0) { logBox.innerHTML = '<div style="color:#666;font-size:9px;text-align:center;padding:8px;">(no events)</div>'; return; } const colors = { 'SCROLL': '#b0b3b8', 'CAPTURE LINK': '#1877f2', 'SUCCESS POST': '#42b72a', 'LINK DEDUP': '#ff77ff', 'SKIP TOP2 KW': '#9c27b0', 'NOT FOUND': '#ffaa00', 'DAILY RESET 00:00 WIB': '#00d0d0', 'SCRAPER STARTED': '#42b72a', 'VIRAL SAVED': '#ff6b35', 'VIRAL DUP': '#ff77ff', 'SKIP REEL': '#888888', 'SMM RETRY': '#9c27b0', 'SMM ALL FAIL': '#e41e3f' }; const icons = { 'SCROLL': '\uD83D\uDCDC', 'CAPTURE LINK': '\uD83D\uDD17', 'SUCCESS POST': '\u2705', 'LINK DEDUP': '\uD83D\uDD01', 'SKIP TOP2 KW': '\u26D4', 'NOT FOUND': '\u274C', 'DAILY RESET 00:00 WIB': '\uD83D\uDD04', 'SCRAPER STARTED': '\uD83D\uDE80', 'VIRAL SAVED': '\uD83D\uDD25', 'VIRAL DUP': '\uD83D\uDD01', 'SKIP REEL': '\uD83C\uDFAC', 'SMM RETRY': '\uD83D\uDD04', 'SMM ALL FAIL': '\uD83D\uDED1' }; const html = logMessages.slice(0, 10).map(m => { const color = colors[m.eventType] || '#e4e6eb'; const icon = icons[m.eventType] || '\u2022'; return '<div style="display:flex;justify-content:space-between;font-size:9px;padding:2px 4px;border-bottom:1px solid #2d2f33;"><span style="color:' + color + ';">' + icon + ' ' + m.eventType + '</span><span style="color:#666;">' + m.time + '</span></div>'; }).join(''); logBox.innerHTML = html; } catch (e) {} }
 
     function setPhase(phase, msg) { currentPhase = phase; if (msg) addLog('PHASE > ' + phase + ': ' + msg, 'phase'); updateUI(); }
     function isFBErrorVisible() { const candidates = document.querySelectorAll('span, div[role="button"], a[role="button"], button'); for (const el of candidates) { if (el.children.length > 3) continue; const text = (el.innerText || el.textContent || '').trim().toLowerCase(); if (text === 'memuat halaman' || text === 'reload page' || text === 'muat ulang' || text === 'coba lagi' || text === 'try again' || text === 'reload') { const rect = el.getBoundingClientRect(); if (rect.width === 0 || rect.height === 0) continue; try { const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden') continue; if (parseFloat(style.opacity) < 0.1) continue; } catch (e) {} return true; } } return false; }
     function isInsideComplementary(el) { let cur = el; let depth = 0; while (cur && cur !== document.body && depth < 50) { const r = cur.getBoundingClientRect(); if (r.width >= 400 && r.width <= 900 && r.height >= 200) return false; if (cur.getAttribute && cur.getAttribute('role') === 'complementary') return true; if (cur.getAttribute && cur.getAttribute('role') === 'article') return false; cur = cur.parentElement; depth++; } return false; }
+
+    function isInMainFeed(post) {
+        if (!post) return false;
+        let el = post;
+        for (let i = 0; i < 30 && el && el !== document.body; i++) {
+            if (el.getAttribute) { const role = el.getAttribute('role'); if (role === 'complementary') return false;
+                const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase(); if (ariaLabel === 'kontak' || ariaLabel === 'contacts') return false; }
+            el = el.parentElement;
+        }
+        el = post;
+        for (let i = 0; i < 30 && el && el !== document.body; i++) {
+            if (el.getAttribute) { const pagelet = el.getAttribute('data-pagelet') || ''; if (pagelet.includes('FeedUnit') || pagelet.includes('MainFeed')) return true; }
+            el = el.parentElement;
+        }
+        const rect = post.getBoundingClientRect(); if (rect.width < 400) return false; return true;
+    }
 
     function findAllMarkers() { const found = []; const seenPosts = new Set(); const bersponsorMarkers = findBersponsorMarkers(); for (const marker of bersponsorMarkers) { const post = findPostContainerFromMarker(marker); if (!post) continue; if (seenPosts.has(post)) continue; seenPosts.add(post); found.push(marker); } return found; }
     function findDecodedBersponsorMarkers() { const found = []; const candidates = document.querySelectorAll('span[dir="auto"], a[role="link"] span, span[aria-labelledby]'); for (const el of candidates) { const rect = el.getBoundingClientRect(); if (rect.width === 0 || rect.height === 0) continue; if (rect.width > 250 || rect.height > 35) continue; const allSpans = el.querySelectorAll('span'); if (allSpans.length < 3) continue; const charSpans = []; for (const sp of allSpans) { if (sp.children.length > 0) continue; const t = sp.textContent || ''; if (t.length === 0 || t.length > 3) continue; const sr = sp.getBoundingClientRect(); if (sr.width === 0 || sr.height === 0) continue; if (sr.left < rect.left - 5 || sr.right > rect.right + 5) continue; if (sr.top < rect.top - 5 || sr.bottom > rect.bottom + 5) continue; try { const cs = window.getComputedStyle(sp); if (cs.opacity === '0' || cs.visibility === 'hidden' || cs.display === 'none') continue; } catch (e) {} charSpans.push({ text: t, x: sr.left, y: sr.top }); } if (charSpans.length < 5) continue; charSpans.sort((a, b) => Math.abs(a.y - b.y) > 5 ? a.y - b.y : a.x - b.x); const decoded = charSpans.map(c => c.text).join(''); const lower = decoded.toLowerCase().replace(/\s/g, ''); if (lower.includes('bersponsor') || lower.includes('sponsored')) { if (isInsideComplementary(el)) continue; found.push(el); } } return found; }
@@ -511,176 +698,68 @@
     async function pressEscape() { const evt = new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true }); document.body.dispatchEvent(evt); document.dispatchEvent(evt); document.documentElement.dispatchEvent(evt); await sleep(200); }
     async function closeDialogForce() { for (let i = 0; i < 5; i++) { if (!isDialogOpen()) return true; await pressEscape(); await sleep(400); } const dialogs = getVisibleDialogs(); for (const dialog of dialogs) { const closeBtns = dialog.querySelectorAll('div[aria-label="Close" i], div[aria-label="Tutup" i], div[role="button"][aria-label*="Close" i], div[role="button"][aria-label*="Tutup" i]'); for (const btn of closeBtns) { const rect = btn.getBoundingClientRect(); if (rect.width > 0 && rect.height > 0) { try { btn.click(); } catch (e) {} await sleep(400); } } } await pressEscape(); await sleep(500); return !isDialogOpen(); }
     function cleanUrl(url) { try { const u = new URL(url, window.location.origin); const keep = ['story_fbid', 'id', 'v', 'fbid', 'set', 'idorvanity', 'multi_permalinks']; const params = new URLSearchParams(); for (const [k, v] of u.searchParams) if (keep.includes(k)) params.append(k, v); u.search = params.toString(); u.hash = ''; if (u.hostname === 'web.facebook.com' || u.hostname === 'm.facebook.com') u.hostname = 'www.facebook.com'; return u.toString(); } catch (e) { return url; } }
+    function isValidPostUrl(url) { if (!url || !url.includes('facebook.com')) return false; try { const u = new URL(url); if (u.pathname === '/' || u.pathname === '') return false; if (u.pathname === '/permalink.php' && !u.searchParams.has('story_fbid') && !u.searchParams.has('fbid')) return false; } catch (e) { return false; } return true; }
+    function urlHasIdentifier(cleanedUrl) { if (!cleanedUrl) return false; try { const u = new URL(cleanedUrl); if (u.pathname === '/' || u.pathname === '') return false; if (u.pathname === '/permalink.php' && !u.searchParams.has('story_fbid') && !u.searchParams.has('fbid')) return false; } catch (e) { return false; } return (cleanedUrl.includes('story_fbid=') || cleanedUrl.includes('fbid=') || cleanedUrl.includes('/posts/') || /\/reel\/[^\/?]+/.test(cleanedUrl) || /\/permalink\.php\?/.test(cleanedUrl) || /\/videos\/[^\/?]+/.test(cleanedUrl) || /\/photo\/[^\/?]+/.test(cleanedUrl)); }
+    async function closeCommentModal() { const MAX_ATTEMPTS = 6; const RETRY_INTERVAL_MS = 800; for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) { const closeBtn = findCloseButton(); if (!closeBtn) { if (!isDialogOpen() && !isValidPostUrl(window.location.href)) return true; await sleep(RETRY_INTERVAL_MS); continue; } try { closeBtn.click(); } catch (e) {} await sleep(RETRY_INTERVAL_MS); if (!isDialogOpen() && !isValidPostUrl(window.location.href)) return true; } return false; }
+    function findCloseButton() { const selectors = ['div[role="button"][aria-label="Tutup"]', 'div[role="button"][aria-label="Close"]', 'div[aria-label="Tutup"][role="button"]', 'div[aria-label="Close"][role="button"]']; for (const sel of selectors) { const buttons = document.querySelectorAll(sel); for (const btn of buttons) { const rect = btn.getBoundingClientRect(); if (rect.width === 0 || rect.height === 0) continue; try { const cs = window.getComputedStyle(btn); if (cs.display === 'none' || cs.visibility === 'hidden') continue; if (parseFloat(cs.opacity) < 0.5) continue; } catch (e) {} return btn; } } return null; }
+    function extractUrlFromOpenDialog() { const dialogs = getVisibleDialogs(); if (dialogs.length === 0) return null; const dialog = dialogs[dialogs.length - 1]; const commentLinks = dialog.querySelectorAll('a[href*="comment_id="]'); for (const link of commentLinks) { const href = link.href || ''; if (href.includes('/share/')) continue; const cleaned = cleanUrl(href); if (urlHasIdentifier(cleaned)) return cleaned; } const directLinks = dialog.querySelectorAll('a[href]'); for (const link of directLinks) { const href = link.href || ''; if (!href || !isValidPostUrl(href) || href.includes('/share/')) continue; try { const u = new URL(href, window.location.origin); if (u.pathname === '/' || u.pathname === '') continue; } catch (e) { continue; } const cleaned = cleanUrl(href); if (urlHasIdentifier(cleaned)) return cleaned; } return null; }
 
     function getSkipKeywords() { return RUNTIME_CONFIG.skip_keywords.slice(); }
 
-    function checkCommentsForKeyword() { const keywords = getSkipKeywords(); if (keywords.length === 0) return { found: false, count: 0, matchedKeyword: null }; const dialogs = getVisibleDialogs(); const scope = dialogs.length > 0 ? dialogs[dialogs.length - 1] : document.body; if (!scope) return { found: false, count: 0, matchedKeyword: null }; const fullText = (scope.textContent || '').toLowerCase(); for (const kw of keywords) { const kwLower = kw.toLowerCase(); const idx = fullText.indexOf(kwLower); if (idx !== -1) { let count = 0; let pos = 0; while ((pos = fullText.indexOf(kwLower, pos)) !== -1) { count++; pos += kwLower.length; } return { found: true, count, matchedKeyword: kw }; } } return { found: false, count: 0, matchedKeyword: null }; }
-    function checkKeywordRelevan() { const result = checkCommentsForKeyword(); if (result.found) addLog('Comments: RELEVAN keyword "' + result.matchedKeyword + '" found ' + result.count + 'x', 'skip'); return result; }
-    async function pageDownAndCheckKeywordTerbaru() { let initialCheck = checkCommentsForKeyword(); if (initialCheck.found) return { keywordFound: true, count: initialCheck.count, matchedKeyword: initialCheck.matchedKeyword }; for (let i = 1; i <= COMMENT_PAGEDOWN_COUNT; i++) { if (shouldStop) return { keywordFound: false }; try { const evt = new KeyboardEvent('keydown', { key: 'PageDown', code: 'PageDown', keyCode: 34, which: 34, bubbles: true, cancelable: true }); document.body.dispatchEvent(evt); document.dispatchEvent(evt); } catch (e) {} try { const dialogs = getVisibleDialogs(); if (dialogs.length > 0) { const dialog = dialogs[dialogs.length - 1]; const scrollables = dialog.querySelectorAll('div'); for (const s of scrollables) { if (s.scrollHeight > s.clientHeight + 100) { s.scrollBy(0, 700); break; } } } } catch (e) {} await sleep(COMMENT_PAGEDOWN_WAIT_MS); const check = checkCommentsForKeyword(); if (check.found) return { keywordFound: true, count: check.count, matchedKeyword: check.matchedKeyword }; } return { keywordFound: false }; }
-
-    // v72.38.5: Scroll ke "Paling Relevan" di dalam dialog (anchor point, jangan klik dulu)
-    async function scrollToPalingRelevanInDialog() {
-        addLog('PR-Scroll: cari "Paling Relevan" di dialog...', 'info');
-        const MAX_WAIT_MS = 30000;
-        const POLL_MS = 2000;
-        const startTime = Date.now();
-
-        while (Date.now() - startTime < MAX_WAIT_MS) {
-            if (shouldStop) return null;
-            const dialogs = getVisibleDialogs();
-            if (dialogs.length === 0) { await sleep(POLL_MS); continue; }
-            const dialog = dialogs[dialogs.length - 1];
-
-            let target = null;
-            let buttonParent = null;
-            const candidates = dialog.querySelectorAll('div, span');
-            for (const el of candidates) {
-                if (el.children.length > 5) continue;
-                const text = (el.innerText || '').trim().toLowerCase();
-                if (text !== 'paling relevan' && text !== 'most relevant') continue;
-                const rect = el.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0) continue;
-                if (rect.width > 200) continue;
-                let cur = el;
-                for (let i = 0; i < 8 && cur && cur !== dialog; i++) {
-                    if (cur.getAttribute && cur.getAttribute('role') === 'button') { buttonParent = cur; break; }
-                    cur = cur.parentElement;
-                }
-                target = buttonParent || el;
-                break;
-            }
-
-            if (!target) {
-                const elapsed = Math.floor((Date.now() - startTime) / 1000);
-                if (elapsed % 10 < 2) addLog('PR-Scroll: belum muncul (' + elapsed + 's)...', 'info');
-                await sleep(POLL_MS);
-                continue;
-            }
-
-            let scrollContainer = null;
-            const divs = dialog.querySelectorAll('div');
-            for (const div of divs) {
-                if (div.scrollHeight > div.clientHeight + 100) {
-                    const r = div.getBoundingClientRect();
-                    if (r.height > 200 && r.width > 300) { scrollContainer = div; break; }
-                }
-            }
-
-            if (scrollContainer) {
-                const tRect = target.getBoundingClientRect();
-                const cRect = scrollContainer.getBoundingClientRect();
-                const scrollNeeded = tRect.top - cRect.top - (cRect.height / 2);
-                scrollContainer.scrollBy({ top: scrollNeeded, behavior: 'smooth' });
-                addLog('PR-Scroll: scrolled ' + Math.round(scrollNeeded) + 'px dalam dialog', 'info');
-                await sleep(1500);
-                const rectAfter = target.getBoundingClientRect();
-                if (rectAfter.top < 0 || rectAfter.top > window.innerHeight) {
-                    target.scrollIntoView({ block: 'center', behavior: 'smooth' });
-                    await sleep(1000);
-                }
-            }
-
-            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-            addLog('PR-Scroll: "Paling Relevan" visible (top=' + Math.round(target.getBoundingClientRect().top) + ', ' + elapsed + 's)', 'success');
-            return target;
+    // ============================================================
+    // v72.39.0: SIMPLIFIED KEYWORD CHECK — cek 2 komentar teratas
+    // Port dari targeting.js STEP 6 (article aria-label scan)
+    // ============================================================
+    function checkTop2CommentsForKeyword() {
+        const skipKeywords = getSkipKeywords();
+        if (skipKeywords.length === 0) {
+            return { found: false, matchedKeyword: null, rank: null, details: 'no skip_keywords configured' };
         }
-        addLog('PR-Scroll: timeout ' + (MAX_WAIT_MS / 1000) + 's, not found', 'warning');
-        return null;
+
+        const dialogs = getVisibleDialogs();
+        const scope = dialogs.length > 0 ? dialogs[dialogs.length - 1] : document;
+
+        // Query articles dengan aria-label komentar (sama dengan targeting.js)
+        const articles = Array.from(scope.querySelectorAll('[role="article"]'))
+            .filter(a => {
+                const al = a.getAttribute('aria-label') || '';
+                return al.startsWith('Komentar oleh') || al.startsWith('Comment by');
+            })
+            .filter(a => {
+                const r = a.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            });
+
+        if (articles.length === 0) {
+            addLog('Top2Check: no comment articles found in dialog', 'info');
+            return { found: false, matchedKeyword: null, rank: null, details: 'no articles (0)' };
+        }
+
+        addLog('Top2Check: found ' + articles.length + ' comment articles, checking top 2', 'info');
+
+        const top2 = articles.slice(0, 2);
+        for (let i = 0; i < top2.length; i++) {
+            const art = top2[i];
+            const text = (art.textContent || '').toLowerCase();
+            const al = art.getAttribute('aria-label') || '';
+            const commenter = al.replace(/^Komentar oleh\s+/, '').replace(/^Comment by\s+/, '').substring(0, 40);
+
+            for (const kw of skipKeywords) {
+                if (text.includes(kw.toLowerCase())) {
+                    addLog('Top2Check: MATCH rank #' + (i + 1) + ' by "' + commenter + '" keyword="' + kw + '"', 'skip');
+                    return {
+                        found: true,
+                        matchedKeyword: kw,
+                        rank: i + 1,
+                        details: 'rank #' + (i + 1) + ' by "' + commenter + '"'
+                    };
+                }
+            }
+            addLog('Top2Check: rank #' + (i + 1) + ' by "' + commenter + '" — clean', 'info');
+        }
+
+        return { found: false, matchedKeyword: null, rank: null, details: 'top 2 clean (' + articles.length + ' total articles)' };
     }
-
-    // v72.38.5: Safe click "Paling Relevan" → pilih "Terbaru" (dialog-scoped, 3 method fallback)
-    function findTerbaruInDropdown() {
-        const selectors = 'div[role="menuitem"], div[role="menuitemcheckbox"], div[role="option"], span, div[role="button"]';
-        const all = document.querySelectorAll(selectors);
-        for (const el of all) {
-            const t = (el.innerText || '').trim().toLowerCase();
-            if (t === 'terbaru' || t.startsWith('terbaru') || t === 'newest' || t.startsWith('newest')) {
-                const r = el.getBoundingClientRect();
-                if (r.width > 0 && r.height > 0 && r.top > 0 && r.top < window.innerHeight) return el;
-            }
-        }
-        return null;
-    }
-
-    async function switchCommentsToTerbaru(prElement) {
-        addLog('Comments: switch ke Terbaru (safe method)...', 'info');
-        let target = prElement;
-
-        if (!target) {
-            addLog('Comments: prElement null, cari ulang di dialog...', 'info');
-            const dialogs = getVisibleDialogs();
-            if (dialogs.length === 0) { addLog('Comments: no dialog open', 'error'); return false; }
-            const dialog = dialogs[dialogs.length - 1];
-            const candidates = dialog.querySelectorAll('div, span');
-            for (const el of candidates) {
-                if (el.children.length > 5) continue;
-                const text = (el.innerText || '').trim().toLowerCase();
-                if (text !== 'paling relevan' && text !== 'most relevant') continue;
-                const rect = el.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0 || rect.width > 200) continue;
-                let cur = el;
-                for (let i = 0; i < 8 && cur; i++) { if (cur.getAttribute && cur.getAttribute('role') === 'button') { target = cur; break; } cur = cur.parentElement; }
-                if (!target) target = el;
-                break;
-            }
-            if (!target) { addLog('Comments: "Paling Relevan" not found in dialog', 'error'); return false; }
-            target.scrollIntoView({ block: 'center', behavior: 'smooth' });
-            await sleep(1000);
-        }
-
-        // Method A: direct click
-        addLog('Comments: click "Paling Relevan" (Method A)...', 'info');
-        try { target.click(); } catch (e) {}
-        await sleep(2000);
-        let terbaruEl = findTerbaruInDropdown();
-        if (terbaruEl) { addLog('Comments: dropdown muncul (Method A)', 'info'); }
-
-        // Method B: pointer events
-        if (!terbaruEl) {
-            addLog('Comments: Method A gagal, coba pointer events (Method B)...', 'info');
-            const rect = target.getBoundingClientRect();
-            const cx = rect.left + rect.width / 2;
-            const cy = rect.top + rect.height / 2;
-            for (const evtType of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-                try { target.dispatchEvent(new PointerEvent(evtType, { bubbles: true, cancelable: true, clientX: cx, clientY: cy, pointerId: 1, pointerType: 'mouse', view: window })); } catch (e) {}
-            }
-            await sleep(2000);
-            terbaruEl = findTerbaruInDropdown();
-            if (terbaruEl) { addLog('Comments: dropdown muncul (Method B)', 'info'); }
-        }
-
-        // Method C: elementsFromPoint
-        if (!terbaruEl) {
-            addLog('Comments: Method B gagal, coba elementsFromPoint (Method C)...', 'info');
-            const rect = target.getBoundingClientRect();
-            const cx = rect.left + rect.width / 2;
-            const cy = rect.top + rect.height / 2;
-            const stack = document.elementsFromPoint(cx, cy);
-            for (const el of stack.slice(0, 5)) {
-                const role = el.getAttribute && el.getAttribute('role');
-                if (role === 'button' || role === 'link' || el.tagName === 'SPAN') {
-                    try { el.click(); } catch (e) {}
-                    await sleep(2000);
-                    terbaruEl = findTerbaruInDropdown();
-                    if (terbaruEl) { addLog('Comments: dropdown muncul (Method C)', 'info'); break; }
-                }
-            }
-        }
-
-        if (!terbaruEl) { addLog('Comments: "Terbaru" dropdown NOT FOUND setelah 3 method', 'error'); await pressEscape(); return false; }
-
-        // Click "Terbaru"
-        addLog('Comments: click "Terbaru"...', 'info');
-        let terbaruClick = terbaruEl;
-        let cur = terbaruEl;
-        for (let i = 0; i < 5 && cur; i++) { const role = cur.getAttribute && cur.getAttribute('role'); if (role === 'menuitem' || role === 'menuitemcheckbox' || role === 'option' || role === 'button') { terbaruClick = cur; break; } cur = cur.parentElement; }
-        try { terbaruClick.click(); } catch (e) {}
-        await sleep(COMMENT_SORT_SWITCH_WAIT_MS);
-        addLog('Comments: switched to Terbaru', 'success');
-        return true;
-    }
-
-    function extractUrlFromOpenDialog() { const dialogs = getVisibleDialogs(); if (dialogs.length === 0) return null; const dialog = dialogs[dialogs.length - 1]; const commentLinks = dialog.querySelectorAll('a[href*="comment_id="]'); for (const link of commentLinks) { const href = link.href || ''; if (href.includes('/share/')) continue; const cleaned = cleanUrl(href); if (urlHasIdentifier(cleaned)) return cleaned; } const directLinks = dialog.querySelectorAll('a[href]'); for (const link of directLinks) { const href = link.href || ''; if (!href || !isValidPostUrl(href) || href.includes('/share/')) continue; try { const u = new URL(href, window.location.origin); if (u.pathname === '/' || u.pathname === '') continue; } catch (e) { continue; } const cleaned = cleanUrl(href); if (urlHasIdentifier(cleaned)) return cleaned; } return null; }
 
     async function extractUrlWithRetry(post, advertiser) {
         const MAX_ATTEMPTS = 3; const URL_WAIT_MS = 4000; const URL_POLL_INTERVAL = 100;
@@ -697,66 +776,83 @@
             await sleep(randDelay(400, 700));
             try { commentBtn.click(); logEvent('CAPTURE LINK'); addLog('Extract: comment button clicked', 'info'); } catch (e) { addLog('Extract: click err: ' + e.message, 'warning'); continue; }
             const startTime = Date.now(); let capturedUrl = null;
-            while (Date.now() - startTime < URL_WAIT_MS) { if (shouldStop) { await closeCommentModal(); return null; } const currentUrl = window.location.href; if (currentUrl !== urlBefore && isValidPostUrl(currentUrl)) { capturedUrl = currentUrl; break; } await sleep(URL_POLL_INTERVAL); }
+            while (Date.now() - startTime < URL_WAIT_MS) {
+                if (shouldStop) { await closeCommentModal(); return null; }
+                const currentUrl = window.location.href;
+                if (currentUrl !== urlBefore && isValidPostUrl(currentUrl)) {
+                    // Simpan URL pertama yang valid (sebelum FB SPA rewrite)
+                    const firstValidUrl = currentUrl;
+                    await sleep(300);
+                    const reReadUrl = window.location.href;
+                    // Validasi ulang setelah sleep — FB SPA kadang rewrite balik ke permalink.php kosong
+                    if (isValidPostUrl(reReadUrl)) {
+                        // Re-read masih valid, pakai versi terbaru (lebih lengkap)
+                        capturedUrl = reReadUrl;
+                    } else {
+                        // Re-read invalid (FB SPA rewrite) — fallback ke URL pertama yang valid
+                        addLog('Extract: FB SPA rewrite ke URL invalid setelah 300ms, fallback ke URL pertama', 'warning');
+                        capturedUrl = firstValidUrl;
+                    }
+                    break;
+                }
+                await sleep(URL_POLL_INTERVAL);
+            }
             if (capturedUrl) { addLog('Extract: URL via navigation: ' + capturedUrl.substring(0, 70), 'info'); }
             else if (isDialogOpen()) { addLog('Extract: URL ga changed, scan DOM dari dialog...', 'info'); capturedUrl = extractUrlFromOpenDialog(); if (capturedUrl) addLog('Extract: URL via DOM scan: ' + capturedUrl.substring(0, 70), 'success'); else addLog('Extract: DOM scan tidak ketemu URL', 'warning'); }
             commentCount = 0;
             if (capturedUrl) {
                 addLog('Extract: tunggu modal fully loaded (max 30s)...', 'info');
                 const readyResult = await waitForCommentSectionReady();
-                if (readyResult.belumAda) { addLog('Extract: SKIP "Belum ada komentar"', 'info'); await closeCommentModal(); await sleep(randDelay(1000, 2000)); return { skipped: true, reason: 'no-comments', matchedKeyword: null, commentCount: 0 }; }
+                // v73.1.0: Filter belumAda DIHAPUS — post tanpa komentar tetap lolos
+                // v73.1.0: Filter timeout-no-count DIHAPUS — post timeout tetap lolos
+                // v73.1.0: Filter min_comment_inbox DIHAPUS — semua count lolos
+                if (readyResult.belumAda) {
+                    addLog('Extract: "Belum ada komentar" detected, lanjut SAVE (no top2 check needed)', 'info');
+                }
                 commentCount = readyResult.count || 0;
                 addLog('Extract: comment count = ' + commentCount + ' (source: ' + readyResult.reason + ')', 'info');
-                if (commentCount === 0 && readyResult.reason === 'timeout') { addLog('Extract: timeout + count=0 > SKIP (unreliable)', 'warning'); await closeCommentModal(); await sleep(randDelay(1000, 2000)); return { skipped: true, reason: 'timeout-no-count', matchedKeyword: null, commentCount: 0 }; }
 
-                const minCommentInbox = RUNTIME_CONFIG.scraper.min_comment_inbox;
-                if (commentCount > 0 && commentCount < minCommentInbox) { skippedBelowMinComment++; logEvent('SKIP LOW COUNT'); addLog('Extract: SKIP count=' + commentCount + ' < min_comment_inbox=' + minCommentInbox, 'info'); await closeCommentModal(); await sleep(randDelay(1000, 2000)); updateUI(); return { skipped: true, reason: 'below-min-comment-inbox', matchedKeyword: null, commentCount: commentCount }; }
-
+                // v72.39.0: SIMPLIFIED KEYWORD CHECK — cek top 2 komentar
+                // v73.1.0: kalau count=0 (belum ada komentar / timeout) skip top2 check (no comments to check anyway)
                 if (commentCount > 0) {
                     const skipKeywords = getSkipKeywords();
                     if (skipKeywords.length === 0) {
                         addLog('Extract: skip keywords empty, langsung SAVE URL (count=' + commentCount + ')', 'info');
                     } else {
-                        // v72.38.5: scroll ke "Paling Relevan" dulu biar comments visible (skip caption panjang)
-                        addLog('Extract: scroll ke Paling Relevan anchor...', 'info');
-                        const prElement = await scrollToPalingRelevanInDialog();
+                        // Tunggu articles muncul di dialog
+                        addLog('Extract: tunggu ' + (ARTICLE_SCAN_WAIT_MS/1000) + 's untuk articles load...', 'info');
+                        await sleep(ARTICLE_SCAN_WAIT_MS);
 
-                        // v72.38.5: delay sebelum scan keyword Relevan
-                        addLog('Extract: delay ' + (KEYWORD_RELEVAN_DELAY_MS/1000) + 's sebelum scan keyword Relevan...', 'info');
-                        await sleep(KEYWORD_RELEVAN_DELAY_MS);
+                        // Cek top 2 komentar saja
+                        addLog('Extract: check top 2 comments untuk ' + skipKeywords.length + ' skip keyword(s)...', 'info');
+                        const top2Result = checkTop2CommentsForKeyword();
 
-                        addLog('Extract: check ' + skipKeywords.length + ' skip keyword(s) di tab Relevan...', 'info');
-                        const relevanCheck = checkKeywordRelevan();
-                        if (relevanCheck.found) {
-                            skippedKeyword++; logEvent('KOMEN RELEVAN');
-                            addLog('Extract: SKIP karena keyword "' + relevanCheck.matchedKeyword + '" di Relevan (count=' + commentCount + ')', 'skip');
-                            await closeCommentModal(); await sleep(randDelay(1000, 2000));
-                            return { skipped: true, reason: 'keyword-found-relevan', matchedKeyword: relevanCheck.matchedKeyword, commentCount: commentCount };
+                        if (top2Result.found) {
+                            skippedKeyword++;
+                            logEvent('SKIP TOP2 KW');
+                            addLog('Extract: SKIP keyword "' + top2Result.matchedKeyword + '" di ' + top2Result.details + ' (count=' + commentCount + ')', 'skip');
+                            await closeCommentModal();
+                            await sleep(randDelay(1000, 2000));
+                            return { skipped: true, reason: 'keyword-found-top2', matchedKeyword: top2Result.matchedKeyword, commentCount: commentCount };
                         }
-                        addLog('Extract: Relevan clean, switch ke Terbaru...', 'info');
-                        const switchOk = await switchCommentsToTerbaru(prElement);
-                        if (!switchOk) {
-                            addLog('Extract: tab Terbaru tidak available, langsung SAVE (count=' + commentCount + ')', 'warning');
-                        } else {
-                            addLog('Extract: switched ke Terbaru, scroll + check keyword...', 'info');
-                            const terbaruResult = await pageDownAndCheckKeywordTerbaru();
-                            if (terbaruResult.keywordFound) {
-                                skippedKeyword++; logEvent('KOMEN TERBARU');
-                                addLog('Extract: SKIP karena keyword "' + terbaruResult.matchedKeyword + '" di Terbaru (count=' + commentCount + ')', 'skip');
-                                await closeCommentModal(); await sleep(randDelay(1000, 2000));
-                                return { skipped: true, reason: 'keyword-found-terbaru', matchedKeyword: terbaruResult.matchedKeyword, commentCount: commentCount };
-                            }
-                            addLog('Extract: Terbaru clean, lanjut SAVE (count=' + commentCount + ')', 'info');
-                        }
+
+                        addLog('Extract: top 2 clean (' + top2Result.details + '), lanjut SAVE (count=' + commentCount + ')', 'info');
                     }
                 }
             }
             await closeCommentModal(); await sleep(randDelay(1000, 2000));
             if (capturedUrl) {
                 if (capturedUrl === lastExtractedUrl) { addLog('Extract: same URL as previous post, retry...', 'warning'); continue; }
+                const finalUrl = cleanUrl(capturedUrl);
+                // FINAL GATE: pastikan URL punya identifier valid sebelum submit
+                // Cegah URL sampah seperti https://www.facebook.com/permalink.php (tanpa story_fbid/fbid)
+                if (!urlHasIdentifier(finalUrl)) {
+                    addLog('Extract: REJECT URL tanpa identifier valid: ' + finalUrl + ' (retry)', 'warning');
+                    continue;
+                }
                 addLog('Extract: captured = ' + capturedUrl.substring(0, 70) + ' | count=' + commentCount, 'success');
                 lastExtractedUrl = capturedUrl;
-                return { url: cleanUrl(capturedUrl), commentCount: commentCount };
+                return { url: finalUrl, commentCount: commentCount };
             }
         }
         logEvent('NOT FOUND');
@@ -764,11 +860,6 @@
         await closeCommentModal();
         return null;
     }
-
-    function isValidPostUrl(url) { if (!url || !url.includes('facebook.com')) return false; try { const u = new URL(url); if (u.pathname === '/' || u.pathname === '') return false; } catch (e) { return false; } return true; }
-    function urlHasIdentifier(cleanedUrl) { if (!cleanedUrl) return false; try { const u = new URL(cleanedUrl); if (u.pathname === '/' || u.pathname === '') return false; } catch (e) { return false; } return (cleanedUrl.includes('story_fbid=') || cleanedUrl.includes('fbid=') || cleanedUrl.includes('/posts/') || /\/reel\/[^\/?]+/.test(cleanedUrl) || /\/permalink\.php/.test(cleanedUrl) || /\/videos\/[^\/?]+/.test(cleanedUrl) || /\/photo\/[^\/?]+/.test(cleanedUrl)); }
-    async function closeCommentModal() { const MAX_ATTEMPTS = 6; const RETRY_INTERVAL_MS = 800; for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) { const closeBtn = findCloseButton(); if (!closeBtn) { if (!isDialogOpen() && !isValidPostUrl(window.location.href)) return true; await sleep(RETRY_INTERVAL_MS); continue; } try { closeBtn.click(); } catch (e) {} await sleep(RETRY_INTERVAL_MS); if (!isDialogOpen() && !isValidPostUrl(window.location.href)) return true; } return false; }
-    function findCloseButton() { const selectors = ['div[role="button"][aria-label="Tutup"]', 'div[role="button"][aria-label="Close"]', 'div[aria-label="Tutup"][role="button"]', 'div[aria-label="Close"][role="button"]']; for (const sel of selectors) { const buttons = document.querySelectorAll(sel); for (const btn of buttons) { const rect = btn.getBoundingClientRect(); if (rect.width === 0 || rect.height === 0) continue; try { const cs = window.getComputedStyle(btn); if (cs.display === 'none' || cs.visibility === 'hidden') continue; if (parseFloat(cs.opacity) < 0.5) continue; } catch (e) {} return btn; } } return null; }
 
     async function extractOnePost(marker) {
         const post = findPostContainerFromMarker(marker);
@@ -800,7 +891,7 @@
 
         if (extractResult && typeof extractResult === 'object' && extractResult.skipped) {
             post.style.outline = '3px solid #9c27b0';
-            addLog('Post: SUDAH-TERKOMEN (keyword: ' + extractResult.matchedKeyword + ', count=' + (extractResult.commentCount || 0) + ', reason=' + extractResult.reason + ') "' + advertiser + '"', 'info'); updateUI();
+            addLog('Post: SKIPPED (keyword: ' + extractResult.matchedKeyword + ', count=' + (extractResult.commentCount || 0) + ', reason=' + extractResult.reason + ') "' + advertiser + '"', 'info'); updateUI();
         } else if (!extractResult) { post.style.outline = '3px dashed #ffaa00'; addLog('Post: EXTRACT-FAIL "' + advertiser + '"', 'warning');
         } else {
             const cleanedUrl = extractResult.url; const commentCount = extractResult.commentCount || 0; const isReel = cleanedUrl.indexOf('/reel/') !== -1;
@@ -827,7 +918,19 @@
             if (shouldOrderSmm) {
                 const comments = getCommentsList();
                 if (comments.length < 5) { addLog('SMM: comments < 5, skip order', 'warning'); }
-                else { await sleep(800); const orderResult = await submitOrderToSMM(cleanedUrl); if (orderResult.ok) { await updateSheetStatus(sheetResult.row, 'Proses', orderResult.order_id, '', orderResult.smm_panel); addLog('Order: "' + advertiser + '" #' + orderResult.order_id + ' (' + orderResult.smm_panel + ')', 'success'); } else { await updateSheetStatus(sheetResult.row, 'Gagal', '', orderResult.error || 'unknown', orderResult.smm_panel); addLog('Order: "' + advertiser + '" failed: ' + orderResult.error, 'error'); } }
+                else {
+                    await sleep(800);
+                    const orderResult = await submitOrderToSMM(cleanedUrl, isViralCandidate);
+                    if (orderResult.ok) {
+                        // v73.2.0: kalau ada retry_note (sukses setelah fallback), kirim ke sheet kolom Note
+                        const noteForSheet = orderResult.retry_note || '';
+                        await updateSheetStatus(sheetResult.row, 'Proses', orderResult.order_id, noteForSheet, orderResult.smm_panel);
+                        addLog('Order: "' + advertiser + '" #' + orderResult.order_id + ' (' + orderResult.smm_panel + ')' + (orderResult.retry_note ? ' [' + orderResult.retry_note + ']' : ''), 'success');
+                    } else {
+                        await updateSheetStatus(sheetResult.row, 'Gagal', '', orderResult.error || 'unknown', orderResult.smm_panel);
+                        addLog('Order: "' + advertiser + '" failed: ' + orderResult.error, 'error');
+                    }
+                }
             }
 
             if (isViralCandidate && sheetResult.ok && sheetResult.status === 'new') {
@@ -857,7 +960,7 @@
         if (mainLoopRunning) { addLog('Main: already running, ignore start', 'warning'); return; }
         if (!RUNTIME_CONFIG.loaded) { addLog('Main: config not loaded yet, cannot start', 'error'); return; }
         mainLoopRunning = true; shouldStop = false; isPaused = false; lastExtractedUrl = null;
-        try { const navigated = await ensureOnFeedPage(); if (navigated) { mainLoopRunning = false; return; } await waitPageFullyLoaded(); addLog('Main: FEED loop active (min_inbox=' + RUNTIME_CONFIG.scraper.min_comment_inbox + ' min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + ')', 'success'); } catch (e) { addLog('Main: FEED ensure error: ' + e.message, 'warning'); }
+        try { const navigated = await ensureOnFeedPage(); if (navigated) { mainLoopRunning = false; return; } await waitPageFullyLoaded(); addLog('Main: FEED loop active (min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + ')', 'success'); } catch (e) { addLog('Main: FEED ensure error: ' + e.message, 'warning'); }
         startWatchdog(); startHeartbeatWatchdog(); startWebWorkerHeartbeat(); updateUI();
         let stuckCount = 0;
         try {
@@ -872,7 +975,7 @@
                 setPhase('waiting', 'Waiting content load'); await interruptibleSleep(SETTINGS.CONTENT_WAIT_MS);
             }
         } catch (e) { addLog('Main: loop exception: ' + e.message + ' > tutup modal, lanjut', 'error'); errorRecoveryCount++; try { if (isDialogOpen()) await closeDialogForce(); } catch (err) {} addLog('WOULD REFRESH: loop-exception (disabled, scraper stopped)', 'error');
-        } finally { stopWatchdog(); if (isDialogOpen()) await closeDialogForce(); mainLoopRunning = false; isPaused = false; setPhase('idle', 'Stopped'); addLog('Main: stopped, stats: detected=' + detectedCount + ' inbox=' + collectedLinks.length + ' viral=' + viralSavedCount + ' dup=' + skippedDuplicate + ' skip-kw=' + skippedKeyword + ' skip-low=' + skippedBelowMinComment + ' skip-reel=' + skippedReels, 'info'); }
+        } finally { stopWatchdog(); if (isDialogOpen()) await closeDialogForce(); mainLoopRunning = false; isPaused = false; setPhase('idle', 'Stopped'); addLog('Main: stopped, stats: detected=' + detectedCount + ' inbox=' + collectedLinks.length + ' viral=' + viralSavedCount + ' dup=' + skippedDuplicate + ' skip-kw=' + skippedKeyword + ' skip-reel=' + skippedReels, 'info'); }
     }
 
     function stopMainLoop() { shouldStop = true; isPaused = false; stopWatchdog(); GM_setValue(AUTO_RESUME_KEY, ''); addLog('Main: STOP requested', 'info'); }
@@ -882,26 +985,67 @@
     function createPanel() {
         const existing = document.getElementById('fb-scraper-panel'); if (existing) existing.remove();
         const panel = document.createElement('div'); panel.id = 'fb-scraper-panel';
-        panel.innerHTML = '<style>#fb-scraper-panel { position: fixed !important; top: 80px !important; right: 15px !important; width: 280px !important; background: #1c1e21 !important; color: #e4e6eb !important; font-family: -apple-system, BlinkMacSystemFont, sans-serif !important; font-size: 13px !important; border-radius: 10px !important; box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important; z-index: 2147483647 !important; border: 1px solid #3a3b3c !important; max-height: calc(100vh - 100px) !important; display: flex !important; flex-direction: column !important; overflow: hidden !important; } #fb-scraper-panel.minimized { width: 160px !important; max-height: none !important; } #fb-scraper-panel .fbs-header { background: linear-gradient(135deg, #42b72a, #2d8a1c); padding: 10px 12px; cursor: move; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; } #fb-scraper-panel .fbs-title { font-weight: 700; color: white; font-size: 13px; } #fb-scraper-panel .fbs-mini-btn { background: rgba(255,255,255,0.2); border: none; color: white; width: 22px; height: 22px; border-radius: 4px; cursor: pointer; } #fb-scraper-panel .fbs-body { padding: 12px; overflow-y: auto; overflow-x: hidden; flex: 1 1 auto; min-height: 0; } #fb-scraper-panel.minimized .fbs-body { display: none; } #fb-scraper-panel .fbs-saved-box { text-align: center; padding: 14px 10px; background: #2d2f33; border-radius: 8px; margin-bottom: 10px; } #fb-scraper-panel .fbs-saved-num { font-size: 32px; font-weight: 700; color: #42b72a; line-height: 1; } #fb-scraper-panel .fbs-saved-label { font-size: 10px; color: #b0b3b8; margin-top: 4px; text-transform: uppercase; } #fb-scraper-panel .fbs-stats-row { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 6px; font-size: 9px; text-align: center; } #fb-scraper-panel .fbs-stat-cell { background: #141618; padding: 4px; border-radius: 4px; } #fb-scraper-panel .fbs-stat-cell .num { font-weight: 700; font-size: 12px; color: #42b72a; } #fb-scraper-panel .fbs-stat-cell .lbl { color: #b0b3b8; font-size: 8px; } #fb-scraper-panel .fbs-btn { width: 100%; padding: 10px; border: none; border-radius: 6px; cursor: pointer; font-weight: 700; font-size: 13px; margin-bottom: 6px; } #fb-scraper-panel .fbs-btn-start { background: #42b72a; color: white; } #fb-scraper-panel .fbs-btn-start:disabled { background: #555; cursor: not-allowed; opacity: 0.6; } #fb-scraper-panel .fbs-btn-stop { background: #e41e3f; color: white; } #fb-scraper-panel .fbs-btn-pause { background: #ffaa00; color: black; } #fb-scraper-panel .fbs-btn-play { background: #1877f2; color: white; } #fb-scraper-panel .fbs-btn-clear { background: #3a3b3c; color: #b0b3b8; font-size: 11px; } #fb-scraper-panel .fbs-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; } #fb-scraper-panel .fbs-row .fbs-btn { margin-bottom: 0; } #fb-scraper-panel .fbs-toast { position: fixed; bottom: 20px; right: 20px; background: #42b72a; color: white; padding: 10px 16px; border-radius: 6px; font-weight: 600; z-index: 2147483647; }</style>' +
-        '<div class="fbs-header" id="fbs-header"><span class="fbs-title">FB Scraper v72.38.6</span><button class="fbs-mini-btn" id="fbs-minimize">_</button></div>' +
-        '<div class="fbs-body">' +
-        '<div class="fbs-saved-box"><div class="fbs-saved-num" id="fbs-stat-count">0</div><div class="fbs-saved-label">Link Inbox Tersimpan</div></div>' +
-        '<div class="fbs-stats-row"><div class="fbs-stat-cell"><div class="num" id="fbs-stat-detected" style="color:#42b72a;">0</div><div class="lbl">Detected</div></div><div class="fbs-stat-cell"><div class="num" id="fbs-stat-dup" style="color:#ff77ff;">0</div><div class="lbl">Inbox Dup</div></div></div>' +
-        '<div class="fbs-stats-row"><div class="fbs-stat-cell"><div class="num" id="fbs-stat-viral-saved" style="color:#ff6b35;">0</div><div class="lbl">Viral Saved</div></div><div class="fbs-stat-cell"><div class="num" id="fbs-stat-viral-dup" style="color:#ff77ff;">0</div><div class="lbl">Viral Dup</div></div></div>' +
-        '<div class="fbs-stats-row"><div class="fbs-stat-cell"><div class="num" id="fbs-stat-skip-low" style="color:#ff6b6b;">0</div><div class="lbl">Skip Low</div></div><div class="fbs-stat-cell"><div class="num" id="fbs-stat-skip-reel" style="color:#888;">0</div><div class="lbl">Skip Reel</div></div></div>' +
-        '<div id="fbs-mode-box" style="background:#1c1e21;border:1px solid #3a3b3c;border-radius:6px;padding:6px 8px;margin-bottom:8px;text-align:center;font-size:10px;"><div id="fbs-mode-status" style="color:#42b72a;font-weight:700;">FEED idle</div></div>' +
-        '<div id="fbs-config-box" style="background:#0d1f3a;border:1px solid #1877f2;border-radius:6px;padding:8px;margin-bottom:8px;font-size:10px;"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><span style="font-weight:700;color:#1877f2;">CONFIG (sheet)</span><button id="fbs-config-refresh" style="background:#1877f2;color:white;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-weight:700;font-size:10px;">Refresh</button></div><div id="fbs-config-status" style="color:#b0b3b8;font-size:9px;line-height:1.5;">Loading...</div></div>' +
-        '<button class="fbs-btn fbs-btn-start" id="fbs-btn-toggle" disabled>WAITING CONFIG...</button>' +
-        '<div class="fbs-row" id="fbs-btn-row-pause-stop" style="display:none;margin-bottom:6px;"><button class="fbs-btn fbs-btn-stop" id="fbs-btn-stop">STOP</button><button class="fbs-btn fbs-btn-pause" id="fbs-btn-pause">PAUSE</button></div>' +
-        '<button class="fbs-btn fbs-btn-clear" id="fbs-btn-clear">Clear Semua</button>' +
-        '<div style="margin-top:10px;border-top:1px solid #3a3b3c;padding-top:8px;"><div style="font-size:11px;color:#b0b3b8;font-weight:700;margin-bottom:4px;">LOGS (30min rolling)</div><div id="fbs-log-box" style="background:#0a0b0c;border:1px solid #2d2f33;border-radius:4px;padding:4px;max-height:160px;overflow-y:auto;font-family:monospace;"><div style="color:#666;font-size:9px;text-align:center;padding:8px;">(no events)</div></div></div>' +
-        '<div style="margin-top:10px;border-top:1px solid #3a3b3c;padding-top:8px;"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><span style="font-size:11px;color:#b0b3b8;font-weight:700;">AKUN FB</span><button id="fbs-btn-akunfb-toggle" style="background:#3a3b3c;color:#b0b3b8;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-weight:700;font-size:10px;">Edit</button></div><div id="fbs-akunfb-status" style="font-size:10px;color:#666;text-align:center;padding:4px;">Loading...</div><div id="fbs-akunfb-config" style="display:none;margin-top:6px;"><input id="fbs-akunfb-input" type="text" placeholder="Nama akun FB" style="width:100%;background:#141618;color:#e4e6eb;border:1px solid #3a3b3c;padding:5px 7px;border-radius:4px;font-size:10px;box-sizing:border-box;margin-bottom:4px;"><button id="fbs-akunfb-save" style="background:#42b72a;color:white;border:none;padding:5px;border-radius:4px;cursor:pointer;font-weight:700;font-size:10px;width:100%;">Save</button></div></div></div>';
+        panel.innerHTML = '<style>'
+        + '#fb-scraper-panel { position: fixed !important; top: 80px !important; right: 15px !important; width: 280px !important; background: #1c1e21 !important; color: #e4e6eb !important; font-family: -apple-system, BlinkMacSystemFont, sans-serif !important; font-size: 13px !important; border-radius: 10px !important; box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important; z-index: 2147483647 !important; border: 1px solid #3a3b3c !important; max-height: calc(100vh - 100px) !important; display: flex !important; flex-direction: column !important; overflow: hidden !important; }'
+        + '#fb-scraper-panel.minimized { width: 160px !important; max-height: none !important; }'
+        + '#fb-scraper-panel .fbs-header { background: linear-gradient(135deg, #42b72a, #2d8a1c); padding: 10px 12px; cursor: move; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }'
+        + '#fb-scraper-panel .fbs-title { font-weight: 700; color: white; font-size: 13px; }'
+        + '#fb-scraper-panel .fbs-mini-btn { background: rgba(255,255,255,0.2); border: none; color: white; width: 22px; height: 22px; border-radius: 4px; cursor: pointer; }'
+        + '#fb-scraper-panel .fbs-body { padding: 12px; overflow-y: auto; overflow-x: hidden; flex: 1 1 auto; min-height: 0; }'
+        + '#fb-scraper-panel.minimized .fbs-body { display: none; }'
+        + '#fb-scraper-panel .fbs-saved-box { text-align: center; padding: 14px 10px; background: #2d2f33; border-radius: 8px; margin-bottom: 10px; }'
+        + '#fb-scraper-panel .fbs-saved-num { font-size: 32px; font-weight: 700; color: #42b72a; line-height: 1; }'
+        + '#fb-scraper-panel .fbs-saved-label { font-size: 10px; color: #b0b3b8; margin-top: 4px; text-transform: uppercase; }'
+        + '#fb-scraper-panel .fbs-stats-row { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 6px; font-size: 9px; text-align: center; }'
+        + '#fb-scraper-panel .fbs-stat-cell { background: #141618; padding: 4px; border-radius: 4px; }'
+        + '#fb-scraper-panel .fbs-stat-cell .num { font-weight: 700; font-size: 12px; color: #42b72a; }'
+        + '#fb-scraper-panel .fbs-stat-cell .lbl { color: #b0b3b8; font-size: 8px; }'
+        + '#fb-scraper-panel .fbs-btn { width: 100%; padding: 10px; border: none; border-radius: 6px; cursor: pointer; font-weight: 700; font-size: 13px; margin-bottom: 6px; }'
+        + '#fb-scraper-panel .fbs-btn-start { background: #42b72a; color: white; }'
+        + '#fb-scraper-panel .fbs-btn-start:disabled { background: #555; cursor: not-allowed; opacity: 0.6; }'
+        + '#fb-scraper-panel .fbs-btn-stop { background: #e41e3f; color: white; }'
+        + '#fb-scraper-panel .fbs-btn-pause { background: #ffaa00; color: black; }'
+        + '#fb-scraper-panel .fbs-btn-play { background: #1877f2; color: white; }'
+        + '#fb-scraper-panel .fbs-btn-clear { background: #3a3b3c; color: #b0b3b8; font-size: 11px; }'
+        + '#fb-scraper-panel .fbs-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }'
+        + '#fb-scraper-panel .fbs-row .fbs-btn { margin-bottom: 0; }'
+        + '#fb-scraper-panel .fbs-toast { position: fixed; bottom: 20px; right: 20px; background: #42b72a; color: white; padding: 10px 16px; border-radius: 6px; font-weight: 600; z-index: 2147483647; }'
+        + '</style>'
+        + '<div class="fbs-header" id="fbs-header"><span class="fbs-title">FB Scraper v73.2.0</span><button class="fbs-mini-btn" id="fbs-minimize">_</button></div>'
+        + '<div class="fbs-body">'
+        + '<div class="fbs-saved-box"><div class="fbs-saved-num" id="fbs-stat-count">0</div><div class="fbs-saved-label">Link Inbox Tersimpan</div></div>'
+        + '<div class="fbs-stats-row"><div class="fbs-stat-cell"><div class="num" id="fbs-stat-detected" style="color:#42b72a;">0</div><div class="lbl">Detected</div></div><div class="fbs-stat-cell"><div class="num" id="fbs-stat-dup" style="color:#ff77ff;">0</div><div class="lbl">Inbox Dup</div></div></div>'
+        + '<div class="fbs-stats-row"><div class="fbs-stat-cell"><div class="num" id="fbs-stat-viral-saved" style="color:#ff6b35;">0</div><div class="lbl">Viral Saved</div></div><div class="fbs-stat-cell"><div class="num" id="fbs-stat-viral-dup" style="color:#ff77ff;">0</div><div class="lbl">Viral Dup</div></div></div>'
+        + '<div class="fbs-stats-row"><div class="fbs-stat-cell"><div class="num" id="fbs-stat-skip-kw" style="color:#9c27b0;">0</div><div class="lbl">Skip KW</div></div><div class="fbs-stat-cell"><div class="num" id="fbs-stat-skip-reel" style="color:#888;">0</div><div class="lbl">Skip Reel</div></div></div>'
+        + '<div id="fbs-mode-box" style="background:#1c1e21;border:1px solid #3a3b3c;border-radius:6px;padding:6px 8px;margin-bottom:8px;text-align:center;font-size:10px;"><div id="fbs-mode-status" style="color:#42b72a;font-weight:700;">FEED idle</div></div>'
+        + '<div id="fbs-config-box" style="background:#0d1f3a;border:1px solid #1877f2;border-radius:6px;padding:8px;margin-bottom:8px;font-size:10px;"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><span style="font-weight:700;color:#1877f2;">CONFIG (sheet)</span><button id="fbs-config-refresh" style="background:#1877f2;color:white;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-weight:700;font-size:10px;">Refresh</button></div><div id="fbs-config-status" style="color:#b0b3b8;font-size:9px;line-height:1.5;">Loading...</div></div>'
+        + '<button class="fbs-btn fbs-btn-start" id="fbs-btn-toggle" disabled>WAITING CONFIG...</button>'
+        + '<div class="fbs-row" id="fbs-btn-row-pause-stop" style="display:none;margin-bottom:6px;"><button class="fbs-btn fbs-btn-stop" id="fbs-btn-stop">STOP</button><button class="fbs-btn fbs-btn-pause" id="fbs-btn-pause">PAUSE</button></div>'
+        + '<button class="fbs-btn fbs-btn-clear" id="fbs-btn-clear">Clear Semua</button>'
+        + '<div style="margin-top:10px;border-top:1px solid #3a3b3c;padding-top:8px;"><div style="font-size:11px;color:#b0b3b8;font-weight:700;margin-bottom:4px;">LOGS (30min rolling)</div><div id="fbs-log-box" style="background:#0a0b0c;border:1px solid #2d2f33;border-radius:4px;padding:4px;max-height:160px;overflow-y:auto;font-family:monospace;"><div style="color:#666;font-size:9px;text-align:center;padding:8px;">(no events)</div></div></div>'
+        + '<div style="margin-top:10px;border-top:1px solid #3a3b3c;padding-top:8px;"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><span style="font-size:11px;color:#b0b3b8;font-weight:700;">AKUN FB</span><button id="fbs-btn-akunfb-toggle" style="background:#3a3b3c;color:#b0b3b8;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-weight:700;font-size:10px;">Edit</button></div><div id="fbs-akunfb-status" style="font-size:10px;color:#666;text-align:center;padding:4px;">Loading...</div><div id="fbs-akunfb-config" style="display:none;margin-top:6px;"><input id="fbs-akunfb-input" type="text" placeholder="Nama akun FB" style="width:100%;background:#141618;color:#e4e6eb;border:1px solid #3a3b3c;padding:5px 7px;border-radius:4px;font-size:10px;box-sizing:border-box;margin-bottom:4px;"><button id="fbs-akunfb-save" style="background:#42b72a;color:white;border:none;padding:5px;border-radius:4px;cursor:pointer;font-weight:700;font-size:10px;width:100%;">Save</button></div></div>'
+        + '</div>';
         document.body.appendChild(panel);
-        wirePanelEvents(panel); makeDraggable(panel, document.getElementById('fbs-header')); applyPanelZoom(); attachPanelZoomHandler(panel);
-        setInterval(() => { try { updateUI(); } catch (e) {} }, 30000); updateUI(); logEvent('SCRAPER STARTED');
+        wirePanelEvents(panel);
+        makeDraggable(panel, document.getElementById('fbs-header'));
+        applyPanelZoom();
+        attachPanelZoomHandler(panel);
+        setInterval(() => { try { updateUI(); } catch (e) {} }, 30000);
+        updateUI();
+        logEvent('SCRAPER STARTED');
         fetchConfigWithRetry().then(() => { startPeriodicConfigRefresh(); });
-        try { const shouldResume = GM_getValue(AUTO_RESUME_KEY, ''); if (shouldResume === '1') GM_setValue(AUTO_RESUME_KEY, '');
-            const tryResume = () => { if (mainLoopRunning) return; if (!RUNTIME_CONFIG.loaded) { setTimeout(tryResume, 3000); return; } const akunFb = (GM_getValue(AKUN_FB_KEY, '') || '').trim(); if (!akunFb) { setTimeout(tryResume, 5000); return; } if (RUNTIME_CONFIG.komentar.length < 5) { setTimeout(tryResume, 5000); return; } try { mainLoop(); } catch (e) {} setTimeout(() => { if (!mainLoopRunning) tryResume(); }, 5000); };
+        try {
+            const shouldResume = GM_getValue(AUTO_RESUME_KEY, '');
+            if (shouldResume === '1') GM_setValue(AUTO_RESUME_KEY, '');
+            const tryResume = () => {
+                if (mainLoopRunning) return;
+                if (!RUNTIME_CONFIG.loaded) { setTimeout(tryResume, 3000); return; }
+                const akunFb = (GM_getValue(AKUN_FB_KEY, '') || '').trim();
+                if (!akunFb) { setTimeout(tryResume, 5000); return; }
+                if (RUNTIME_CONFIG.komentar.length < 5) { setTimeout(tryResume, 5000); return; }
+                try { mainLoop(); } catch (e) {}
+                setTimeout(() => { if (!mainLoopRunning) tryResume(); }, 5000);
+            };
             setTimeout(tryResume, 8000);
         } catch (e) {}
     }
@@ -909,11 +1053,26 @@
     function wirePanelEvents(panel) {
         document.getElementById('fbs-minimize').addEventListener('click', e => { e.stopPropagation(); panel.classList.toggle('minimized'); });
         document.getElementById('fbs-config-refresh').addEventListener('click', async () => { await forceRefreshConfig(); });
-        document.getElementById('fbs-btn-toggle').addEventListener('click', () => { if (mainLoopRunning) return; if (!RUNTIME_CONFIG.loaded) { alert('Config belum loaded.'); return; } const akunFb = (GM_getValue(AKUN_FB_KEY, '') || '').trim(); if (!akunFb) { alert('Nama Akun FB belum diisi!'); return; } const commentsList = getCommentsList(); if (commentsList.length < 5) { alert('Komentar di sheet kurang dari 5!'); return; } mainLoop(); });
+        document.getElementById('fbs-btn-toggle').addEventListener('click', () => {
+            if (mainLoopRunning) return;
+            if (!RUNTIME_CONFIG.loaded) { alert('Config belum loaded.'); return; }
+            const akunFb = (GM_getValue(AKUN_FB_KEY, '') || '').trim();
+            if (!akunFb) { alert('Nama Akun FB belum diisi!'); return; }
+            const commentsList = getCommentsList();
+            if (commentsList.length < 5) { alert('Komentar di sheet kurang dari 5!'); return; }
+            mainLoop();
+        });
         document.getElementById('fbs-btn-stop').addEventListener('click', () => { if (!mainLoopRunning) return; stopMainLoop(); });
         document.getElementById('fbs-btn-pause').addEventListener('click', () => togglePause());
-        document.getElementById('fbs-btn-clear').addEventListener('click', () => { if (confirm('Hapus ' + collectedLinks.length + ' link?')) { clearLinks(); logMessages = []; detectedCount = 0; scrollAttempts = 0; skippedNoCTA = 0; skippedExcluded = 0; skippedKeyword = 0; skippedDuplicate = 0; skippedBelowMinComment = 0; skippedReels = 0; viralSavedCount = 0; viralDupCount = 0; linksSinceLastDelay = 0; retryCount = 0; errorRecoveryCount = 0; lastExtractedUrl = null; document.querySelectorAll('[data-fb-extracted], [data-fb-processing]').forEach(el => { el.removeAttribute('data-fb-extracted'); el.removeAttribute('data-fb-processing'); el.style.outline = ''; }); addLog('UI: cleared all stats + markers', 'info'); updateUI(); } });
-        const akunfbInput = document.getElementById('fbs-akunfb-input'); const akunfbStatus = document.getElementById('fbs-akunfb-status');
+        document.getElementById('fbs-btn-clear').addEventListener('click', () => {
+            if (confirm('Hapus ' + collectedLinks.length + ' link?')) {
+                clearLinks(); logMessages = []; detectedCount = 0; scrollAttempts = 0; skippedNoCTA = 0; skippedExcluded = 0; skippedKeyword = 0; skippedDuplicate = 0; skippedReels = 0; viralSavedCount = 0; viralDupCount = 0; linksSinceLastDelay = 0; retryCount = 0; errorRecoveryCount = 0; lastExtractedUrl = null;
+                document.querySelectorAll('[data-fb-extracted], [data-fb-processing]').forEach(el => { el.removeAttribute('data-fb-extracted'); el.removeAttribute('data-fb-processing'); el.style.outline = ''; });
+                addLog('UI: cleared all stats + markers', 'info'); updateUI();
+            }
+        });
+        const akunfbInput = document.getElementById('fbs-akunfb-input');
+        const akunfbStatus = document.getElementById('fbs-akunfb-status');
         akunfbInput.value = GM_getValue(AKUN_FB_KEY, '');
         function updateAkunFbStatus() { const value = (GM_getValue(AKUN_FB_KEY, '') || '').trim(); if (!value) akunfbStatus.innerHTML = '<span style="color:#ff6b6b;">Belum diisi</span>'; else akunfbStatus.innerHTML = '<span style="color:#42b72a;">OK ' + escapeHTML(value) + '</span>'; }
         updateAkunFbStatus();
@@ -938,31 +1097,113 @@
 
     function updateUI() {
         try {
-            const c = document.getElementById('fbs-stat-count'); const btnStart = document.getElementById('fbs-btn-toggle'); const btnRow = document.getElementById('fbs-btn-row-pause-stop'); const btnPause = document.getElementById('fbs-btn-pause');
+            const c = document.getElementById('fbs-stat-count');
+            const btnStart = document.getElementById('fbs-btn-toggle');
+            const btnRow = document.getElementById('fbs-btn-row-pause-stop');
+            const btnPause = document.getElementById('fbs-btn-pause');
             if (c) c.textContent = collectedLinks.length;
-            const detected = document.getElementById('fbs-stat-detected'); const dup = document.getElementById('fbs-stat-dup'); if (detected) detected.textContent = detectedCount; if (dup) dup.textContent = skippedDuplicate;
-            const viralSaved = document.getElementById('fbs-stat-viral-saved'); const viralDup = document.getElementById('fbs-stat-viral-dup'); if (viralSaved) viralSaved.textContent = viralSavedCount; if (viralDup) viralDup.textContent = viralDupCount;
-            const skipLow = document.getElementById('fbs-stat-skip-low'); const skipReel = document.getElementById('fbs-stat-skip-reel'); if (skipLow) skipLow.textContent = skippedBelowMinComment; if (skipReel) skipReel.textContent = skippedReels;
+            const detected = document.getElementById('fbs-stat-detected');
+            const dup = document.getElementById('fbs-stat-dup');
+            if (detected) detected.textContent = detectedCount;
+            if (dup) dup.textContent = skippedDuplicate;
+            const viralSaved = document.getElementById('fbs-stat-viral-saved');
+            const viralDup = document.getElementById('fbs-stat-viral-dup');
+            if (viralSaved) viralSaved.textContent = viralSavedCount;
+            if (viralDup) viralDup.textContent = viralDupCount;
+            const skipKw = document.getElementById('fbs-stat-skip-kw');
+            const skipReel = document.getElementById('fbs-stat-skip-reel');
+            if (skipKw) skipKw.textContent = skippedKeyword;
+            if (skipReel) skipReel.textContent = skippedReels;
+            const modeStatus = document.getElementById('fbs-mode-status');
+            if (modeStatus) {
+                if (!RUNTIME_CONFIG.loaded) { modeStatus.textContent = 'CONFIG loading...'; modeStatus.style.color = '#ffaa00'; }
+                else if (mainLoopRunning && isPaused) { modeStatus.textContent = 'FEED PAUSED'; modeStatus.style.color = '#ffaa00'; }
+                else if (mainLoopRunning) { modeStatus.textContent = 'FEED ACTIVE — ' + currentPhase; modeStatus.style.color = '#42b72a'; }
+                else { modeStatus.textContent = 'FEED idle'; modeStatus.style.color = '#b0b3b8'; }
+            }
+            if (btnStart) {
+                if (!RUNTIME_CONFIG.loaded) { btnStart.disabled = true; btnStart.textContent = 'WAITING CONFIG...'; btnStart.className = 'fbs-btn fbs-btn-start'; }
+                else if (mainLoopRunning) { btnStart.style.display = 'none'; if (btnRow) btnRow.style.display = 'grid'; }
+                else { btnStart.style.display = 'block'; btnStart.disabled = false; btnStart.textContent = 'START SCRAPING'; btnStart.className = 'fbs-btn fbs-btn-start'; if (btnRow) btnRow.style.display = 'none'; }
+            }
+            if (btnPause) {
+                if (isPaused) { btnPause.textContent = 'RESUME'; btnPause.className = 'fbs-btn fbs-btn-play'; }
+                else { btnPause.textContent = 'PAUSE'; btnPause.className = 'fbs-btn fbs-btn-pause'; }
+            }
             const configStatus = document.getElementById('fbs-config-status');
-            if (configStatus) { if (!RUNTIME_CONFIG.loaded) { configStatus.innerHTML = '<span style="color:#ff6b6b;">' + RUNTIME_CONFIG.last_fetch_status + '</span>'; } else { const elapsed = Math.floor((Date.now() - RUNTIME_CONFIG.last_fetch_ts) / 1000); const commentPanels = RUNTIME_CONFIG.smm_panels.filter(p => p.function === 'comment').length; const likePanels = RUNTIME_CONFIG.smm_panels.filter(p => p.function === 'like').length; configStatus.innerHTML = '<div style="color:#42b72a;">' + RUNTIME_CONFIG.komentar.length + ' komen | ' + RUNTIME_CONFIG.skip_keywords.length + ' skip | ' + RUNTIME_CONFIG.exclude_advertisers.length + ' excl</div><div style="color:#42b72a;">SMM: ' + commentPanels + ' comment | ' + likePanels + ' like</div><div style="color:#1877f2;">min_inbox=' + RUNTIME_CONFIG.scraper.min_comment_inbox + ' min_viral=' + RUNTIME_CONFIG.scraper.min_comment_viral + ' reels=' + RUNTIME_CONFIG.scraper.include_reels + '</div><div style="color:#666;font-size:8px;">fetched ' + elapsed + 's ago</div>'; } }
-            if (btnStart && btnRow) { if (mainLoopRunning) { btnStart.style.display = 'none'; btnRow.style.display = 'grid'; } else { btnStart.style.display = 'block'; btnRow.style.display = 'none'; if (!RUNTIME_CONFIG.loaded) { btnStart.textContent = 'WAITING CONFIG...'; btnStart.disabled = true; } else if (RUNTIME_CONFIG.komentar.length < 5) { btnStart.textContent = 'KOMEN < 5'; btnStart.disabled = true; } else { btnStart.textContent = 'START'; btnStart.disabled = false; } } }
-            if (btnPause) { if (isPaused) { btnPause.textContent = 'PLAY'; btnPause.className = 'fbs-btn fbs-btn-play'; } else { btnPause.textContent = 'PAUSE'; btnPause.className = 'fbs-btn fbs-btn-pause'; } }
-            const modeStatus = document.getElementById('fbs-mode-status'); if (modeStatus) { if (!mainLoopRunning) { modeStatus.textContent = 'FEED idle'; modeStatus.style.color = '#42b72a'; } else if (isPaused) { modeStatus.textContent = 'PAUSED'; modeStatus.style.color = '#ffaa00'; } else { modeStatus.textContent = 'RUNNING'; modeStatus.style.color = '#42b72a'; } }
+            if (configStatus && RUNTIME_CONFIG.loaded) {
+                const commentPanels = RUNTIME_CONFIG.smm_panels.filter(p => p.function === 'comment' && p.enabled).length;
+                const likePanels = RUNTIME_CONFIG.smm_panels.filter(p => p.function === 'like' && p.enabled).length;
+                // v73.2.0: tampilin jumlah akun aktif + total service combinations
+                const activeAccounts = buildActiveAccounts();
+                const totalServices = activeAccounts.reduce((sum, a) => sum + a.services.length, 0);
+                const ts = RUNTIME_CONFIG.last_fetch_ts ? new Date(RUNTIME_CONFIG.last_fetch_ts).toLocaleTimeString('id-ID', { hour12: false }) : '-';
+                configStatus.innerHTML = 'Komentar: <b>' + RUNTIME_CONFIG.komentar.length + '</b> | Skip KW: <b>' + RUNTIME_CONFIG.skip_keywords.length + '</b><br>'
+                    + 'Exclude: <b>' + RUNTIME_CONFIG.exclude_advertisers.length + '</b> | SMM: <b>' + RUNTIME_CONFIG.smm_panels.length + '</b> (comment=' + commentPanels + ' like=' + likePanels + ')<br>'
+                    + 'Active: <b>' + activeAccounts.length + '</b> akun, <b>' + totalServices + '</b> services | Reels: <b>' + (RUNTIME_CONFIG.scraper.include_reels ? 'ON' : 'OFF') + '</b><br>'
+                    + 'Min viral: <b>' + RUNTIME_CONFIG.scraper.min_comment_viral + '</b> | Inbox Qty: <b>' + RUNTIME_CONFIG.scraper.smm_inbox_quantity + '</b><br>'
+                    + 'Last fetch: ' + ts + ' (' + RUNTIME_CONFIG.last_fetch_status + ')';
+            }
+            renderLogPanel();
         } catch (e) {}
     }
 
-    function flashNotification(message) { const toast = document.createElement('div'); toast.className = 'fbs-toast'; toast.textContent = message; document.body.appendChild(toast); setTimeout(() => toast.remove(), 2000); }
-    function checkAndReloadAfterNavigation() { try { const needReload = GM_getValue(NEED_RELOAD_AFTER_NAV_KEY, ''); if (needReload === '1') { GM_setValue(NEED_RELOAD_AFTER_NAV_KEY, ''); addLog('Nav: reload after navigation (v72.38.5)', 'info'); setTimeout(() => { window.location.reload(); }, RELOAD_AFTER_NAV_DELAY_MS); } } catch (e) {} }
-    checkAndReloadAfterNavigation();
-
-    function getWIBNow() { const now = new Date(); const utcMs = now.getTime() + (now.getTimezoneOffset() * 60000); return new Date(utcMs + (7 * 3600000)); }
-    function msUntilNextMidnightWIB() { const nowWIB = getWIBNow(); const tomorrowWIB = new Date(nowWIB); tomorrowWIB.setHours(24, 0, 0, 0); return tomorrowWIB.getTime() - nowWIB.getTime(); }
-    function doDailyReset() { try { collectedLinks = []; saveLinks(); detectedCount = 0; scrollAttempts = 0; skippedNoCTA = 0; skippedExcluded = 0; skippedKeyword = 0; skippedDuplicate = 0; skippedBelowMinComment = 0; skippedReels = 0; viralSavedCount = 0; viralDupCount = 0; linksSinceLastDelay = 0; retryCount = 0; errorRecoveryCount = 0; lastExtractedUrl = null; document.querySelectorAll('[data-fb-extracted], [data-fb-processing]').forEach(el => { el.removeAttribute('data-fb-extracted'); el.removeAttribute('data-fb-processing'); el.style.outline = ''; }); logEvent('DAILY RESET 00:00 WIB'); updateUI(); } catch (e) {} }
-    function scheduleDailyReset() { const msUntil = msUntilNextMidnightWIB(); setTimeout(() => { doDailyReset(); setInterval(doDailyReset, 24 * 60 * 60 * 1000); }, msUntil); }
-    scheduleDailyReset();
-
-    createPanel();
-
+    function flashNotification(msg) {
+        try {
+            const toast = document.createElement('div');
+            toast.className = 'fbs-toast';
+            toast.textContent = msg;
+            document.body.appendChild(toast);
+            setTimeout(() => { try { toast.remove(); } catch (e) {} }, 3000);
+        } catch (e) {}
     }
 
-})();
+    // Daily reset at 00:00 WIB
+    function scheduleDailyReset() {
+        function getNextMidnightWIB() {
+            // Hitung 00:00 WIB berikutnya dengan cara sederhana dan aman
+            const now = Date.now();
+            const WIB_OFFSET_MS = 7 * 3600000; // UTC+7
+            const DAY_MS = 86400000;
+            // Waktu WIB sekarang dalam ms sejak epoch
+            const wibNowMs = now + WIB_OFFSET_MS;
+            // Ms yang sudah lewat sejak midnight WIB hari ini
+            const msSinceMidnightWIB = wibNowMs % DAY_MS;
+            // Ms sampai midnight WIB berikutnya
+            let msToNext = DAY_MS - msSinceMidnightWIB;
+            // Safety guard: kalau < 60 detik (edge case tepat di midnight), set 24 jam
+            if (msToNext < 60000) msToNext = DAY_MS;
+            return msToNext;
+        }
+        function doReset() {
+            detectedCount = 0; scrollAttempts = 0; skippedNoCTA = 0; skippedExcluded = 0; skippedKeyword = 0; skippedDuplicate = 0; skippedReels = 0; viralSavedCount = 0; viralDupCount = 0; linksSinceLastDelay = 0; retryCount = 0; errorRecoveryCount = 0;
+            logMessages = [];
+            logEvent('DAILY RESET 00:00 WIB');
+            addLog('Daily reset: all counters cleared', 'success');
+            updateUI();
+            setTimeout(doReset, getNextMidnightWIB());
+        }
+        setTimeout(doReset, getNextMidnightWIB());
+    }
+    scheduleDailyReset();
+
+    function checkAndReloadAfterNavigation() {
+        try {
+            const needReload = GM_getValue(NEED_RELOAD_AFTER_NAV_KEY, '');
+            if (needReload === '1') {
+                GM_setValue(NEED_RELOAD_AFTER_NAV_KEY, '');
+                setTimeout(() => {
+                    addLog('Nav: post-navigate reload triggered', 'info');
+                    window.location.reload();
+                }, RELOAD_AFTER_NAV_DELAY_MS);
+            }
+        } catch (e) {}
+    }
+    checkAndReloadAfterNavigation();
+
+    // Init panel
+    createPanel();
+
+    } // end mainScript
+
+})(); // end IIFE
