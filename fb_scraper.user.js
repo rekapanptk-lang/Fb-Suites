@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FB Sponsored Ads Link Scraper
 // @namespace    https://riko.local/fbscraper
-// @version      73.3.0
-// @description  v73.3.0 - Top 2 comments check dual filter: skip_keyword + own-comment-list match (substring, case-insensitive). v73.2.0 = SMM multi-service retry per akun. v73.1.0 = filter min_comment_inbox/belumAda/timeout-no-count DIHAPUS + SMM order ambil urut #1-N. v73.0.0 = SMM order quantity logic. v72.39.x = simplified keyword check + permalink.php hardening.
+// @version      73.4.0
+// @description  v73.4.0 - Comment Rank scan: 5x PageDown scan seluruh dialog, cari tiap skip_keyword (normalized font) di rank berapa, tulis ke Inbox kolom P. Gate SMM: dedup=no call+update rank; rank 1/2=no call+update rank; rank>=3 / not found=CALL comment. v73.3.0 = Top 2 dual filter. v73.2.0 = SMM multi-service retry per akun.
 // @author       Riko
 // @match        *://*.facebook.com/*
 // @match        *://*.messenger.com/*
@@ -94,7 +94,7 @@
 
     function navigateToFeedRecover(reason) {
         try {
-            console.error('[FB Scraper v73.3.0] navigateToFeedRecover called outside mainScript scope: ' + reason);
+            console.error('[FB Scraper v73.4.0] navigateToFeedRecover called outside mainScript scope: ' + reason);
         } catch (e) {}
     }
 
@@ -102,7 +102,7 @@
     function scheduleGlobalErrorReload(reason) {
         try {
             globalErrorCount++;
-            console.warn('[FB Scraper v73.3.0] WOULD REFRESH (global-error, disabled): ' + reason + ' (total: ' + globalErrorCount + ')');
+            console.warn('[FB Scraper v73.4.0] WOULD REFRESH (global-error, disabled): ' + reason + ' (total: ' + globalErrorCount + ')');
         } catch (e) {}
     }
 
@@ -152,13 +152,13 @@
                 reason === 'fb-error-after-scroll'
             );
             if (allowRefresh) {
-                console.warn('[FB Scraper v73.3.0] REFRESH AKTIF: ' + reason);
+                console.warn('[FB Scraper v73.4.0] REFRESH AKTIF: ' + reason);
                 addLog('REFRESH: ' + reason, 'error');
                 GM_setValue(NEED_RELOAD_AFTER_NAV_KEY, '1');
                 GM_setValue(AUTO_RESUME_KEY, '1');
                 window.location.href = FEED_URL_V16;
             } else {
-                console.error('[FB Scraper v73.3.0] WOULD REFRESH (disabled): ' + reason);
+                console.error('[FB Scraper v73.4.0] WOULD REFRESH (disabled): ' + reason);
                 addLog('WOULD REFRESH: ' + reason + ' (disabled, lanjut scroll)', 'error');
             }
         } catch (e) {}
@@ -218,7 +218,6 @@
             if (typeof s.min_comment_inbox === 'number' && s.min_comment_inbox >= 0) scraper.min_comment_inbox = s.min_comment_inbox;
             if (typeof s.min_comment_viral === 'number' && s.min_comment_viral >= 0) scraper.min_comment_viral = s.min_comment_viral;
             if (typeof s.include_reels === 'boolean') scraper.include_reels = s.include_reels;
-            // v73.0.0: smm_inbox_quantity untuk single-write (inbox only) order quantity
             if (typeof s.smm_inbox_quantity === 'number' && s.smm_inbox_quantity >= 1) scraper.smm_inbox_quantity = s.smm_inbox_quantity;
         }
         return scraper;
@@ -297,8 +296,8 @@
     let detectedCount = 0;
     let skippedNoCTA = 0;
     let skippedExcluded = 0;
-    let skippedKeyword = 0;
-    let skippedOwnComment = 0;
+    let rankFoundCount = 0;
+    let rankSkipCount = 0;
     let skippedDuplicate = 0;
     let skippedReels = 0;
     let viralSavedCount = 0;
@@ -362,16 +361,29 @@
         const akunWithVersion = rawAkun ? (rawAkun + ' - v' + TM_VERSION) : '';
         const payload = { action: 'submit', url: data.url, akun_fb: akunWithVersion, komentar: HARDCODED_KOMENTAR };
         if (dualWrite === true) payload.dual_write = true;
-        addLog('Sheet: POST submit url=' + data.url.substring(0, 60) + '...' + (dualWrite ? ' [DUAL-WRITE]' : ''), 'info');
+        // v73.4.0: kirim comment_rank sekalian pas submit — GAS tulis kolom P
+        // baik row baru (new) maupun existing (dedup-active).
+        if (data.comment_rank !== undefined && data.comment_rank !== null) payload.comment_rank = data.comment_rank;
+        addLog('Sheet: POST submit url=' + data.url.substring(0, 60) + '...' + (dualWrite ? ' [DUAL-WRITE]' : '') + (data.comment_rank ? ' [RANK:' + data.comment_rank + ']' : ''), 'info');
         return apiCallWithRetry({ method: 'POST', url: ENDPOINT_URL, data: JSON.stringify(payload), headers: { 'Content-Type': 'text/plain;charset=utf-8' },
             parseResponse: function(responseText) {
                 const result = JSON.parse(responseText);
                 if (result.ok) { if (result.status === 'new') addLog('Sheet: NEW row #' + result.row + (result.dual_write ? ' [DUAL-WRITE]' : ''), 'success'); else if (result.status === 'duplicate') addLog('Sheet: DUPLICATE row #' + result.row, 'info'); return { ok: true, status: result.status, row: result.row }; }
-                else if (result.reason === 'dedup-active') { addLog('Sheet: DEDUP-ACTIVE (existing row #' + result.existing_row + ')', 'info'); return { ok: false, reason: 'dedup-active', existing_row: result.existing_row }; }
+                else if (result.reason === 'dedup-active') { addLog('Sheet: DEDUP-ACTIVE (existing row #' + result.existing_row + ')' + (result.rank_written ? ' [rank updated]' : ''), 'info'); return { ok: false, reason: 'dedup-active', existing_row: result.existing_row, rank_written: result.rank_written }; }
                 else if (result.reason === 'dedup-viral') { addLog('Sheet: DEDUP-VIRAL (URL already in Viral_History row #' + result.existing_row + ')', 'info'); return { ok: false, reason: 'dedup-viral', existing_row: result.existing_row, existing_status: result.existing_status }; }
                 else { addLog('Sheet: error: ' + (result.error || 'unknown'), 'warning'); return { ok: false, reason: 'sheet-error', error: result.error }; }
             }
         }, 'Sheet.submit');
+    }
+
+    // v73.4.0: update kolom Comment Rank (P) doang — dipake buat kasus
+    // dedup-active tanpa comment_rank di submit, ATAU update terpisah.
+    function updateCommentRank(row, commentRank) {
+        const payload = { action: 'update_comment_rank', row: row, comment_rank: commentRank };
+        addLog('Sheet: POST update_comment_rank row=' + row + ' rank="' + commentRank + '"', 'info');
+        return apiCallWithRetry({ method: 'POST', url: ENDPOINT_URL, data: JSON.stringify(payload), headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            parseResponse: function(responseText) { const result = JSON.parse(responseText); if (result.ok) { addLog('Sheet: Comment Rank updated row #' + row, 'info'); return { ok: true }; } else { addLog('Sheet: update_comment_rank failed: ' + (result.error || 'unknown'), 'warning'); return { ok: false, error: result.error }; } }
+        }, 'Sheet.updateRank');
     }
 
     function submitToViralHistory(url, commentCount, dualWrite) {
@@ -388,9 +400,11 @@
         }, 'Viral.submit');
     }
 
-    function updateSheetStatus(row, status, orderId, note, smmPanel) {
+    function updateSheetStatus(row, status, orderId, note, smmPanel, commentRank) {
         const payload = { action: 'update_status', row: row, status: status };
         if (orderId) payload.order_id = orderId; if (note) payload.note = note; if (smmPanel) payload.smm_panel = smmPanel;
+        // v73.4.0: kirim comment_rank kalau ada (dipake pas order sukses biar rank + status 1 call)
+        if (commentRank !== undefined && commentRank !== null && commentRank !== '') payload.comment_rank = commentRank;
         addLog('Sheet: POST update_status row=' + row + ' status=' + status, 'info');
         return apiCallWithRetry({ method: 'POST', url: ENDPOINT_URL, data: JSON.stringify(payload), headers: { 'Content-Type': 'text/plain;charset=utf-8' },
             parseResponse: function(responseText) { const result = JSON.parse(responseText); if (result.ok) { addLog('Sheet: Status updated row #' + row + ' > ' + status, 'info'); return { ok: true }; } else { addLog('Sheet: update failed: ' + (result.error || 'unknown'), 'warning'); return { ok: false, error: result.error }; } }
@@ -399,10 +413,6 @@
 
     function getCommentsList() { return RUNTIME_CONFIG.komentar.slice(); }
 
-    // v73.2.0: Build accounts grouped by panel (not flat combos)
-    // Returns: [{ panel, services: [id1, id2, ...], label_prefix }, ...]
-    // Order of accounts preserved from RUNTIME_CONFIG.smm_panels.
-    // Order of services within account preserved (#1,#2,#3,... for fallback order).
     function buildActiveAccounts() {
         const accounts = [];
         for (const panel of RUNTIME_CONFIG.smm_panels) {
@@ -425,8 +435,6 @@
         return accounts;
     }
 
-    // v73.2.0: Pick 1 account by round-robin (counter-based)
-    // Counter advance handled SEPARATELY after order complete (see submitOrderToSMM)
     function getSmmAccountByIndex(index) {
         const accounts = buildActiveAccounts();
         if (accounts.length === 0) return null;
@@ -447,8 +455,6 @@
         } catch (e) {}
     }
 
-    // v73.2.0: Detect "saldo habis" / "API key salah" error → skip whole account
-    // Sumber error message: BuzzerPanel docs (PPI/AUN belum lengkap)
     function isAccountLevelError(errorMsg) {
         if (!errorMsg) return false;
         const lower = errorMsg.toString().toLowerCase();
@@ -460,8 +466,6 @@
             || lower.includes('api key invalid');
     }
 
-    // v73.2.0: Helper — try ONE service order, return result
-    // Tidak handle retry logic, hanya 1 attempt (apiCallWithRetry handle network retry internally)
     async function trySingleSmmOrder(account, serviceId, targetUrl, comments, modeLabel) {
         const panel = account.panel;
         const provider = panel.provider;
@@ -501,18 +505,10 @@
         return result;
     }
 
-    // v73.2.0: Multi-service retry per akun + fallback antar akun
-    // Flow:
-    //   1. Pick account by round-robin (counter advance HANYA setelah seluruh order selesai)
-    //   2. Try setiap service di akun itu (urut, dengan 500ms delay antar attempt)
-    //   3. Kalau "Saldo tidak cukup" / "API Key salah" → skip semua service di akun ini, fallback ke akun lain
-    //   4. Kalau semua service akun habis (non-account-level error) → fallback ke akun lain (counter +1)
-    //   5. Loop sampai sukses atau semua akun habis dicoba
     async function submitOrderToSMM(targetUrl, isViralCandidate) {
         const allComments = getCommentsList();
         if (allComments.length < 5) { addLog('SMM: comments < 5, skip order', 'warning'); return { ok: false, reason: 'comments-insufficient' }; }
 
-        // v73.1.0: Pilih quantity berdasarkan mode (single-write vs dual-write)
         let comments, modeLabel;
         if (isViralCandidate === true) {
             comments = allComments;
@@ -528,23 +524,21 @@
         if (accounts.length === 0) { addLog('SMM: no active accounts (comment panels)', 'warning'); return { ok: false, error: 'no-active-accounts' }; }
 
         const startCounter = getCurrentSmmCounter();
-        const failureReport = []; // untuk note kalau semua gagal: [{account, services: [{id, msg}], skipped_reason?}, ...]
+        const failureReport = [];
         let accountsTried = 0;
-        let counterAdvancedBy = 0; // berapa counter advance setelah semua selesai
+        let counterAdvancedBy = 0;
 
-        // Loop accounts max sebanyak total accounts (try semua)
         for (let attempt = 0; attempt < accounts.length; attempt++) {
             const account = getSmmAccountByIndex(startCounter + attempt);
             if (!account) break;
             accountsTried++;
 
-            const accountFailures = []; // services yang gagal di akun ini
-            let accountSkipReason = null; // 'saldo' / 'apikey' kalau account-level error
+            const accountFailures = [];
+            let accountSkipReason = null;
             let successResult = null;
 
             addLog('SMM: round-robin pick ' + account.label_prefix + ' (account ' + (account.account_index + 1) + '/' + account.total_accounts + ', try-attempt ' + (attempt + 1) + ')', 'info');
 
-            // Loop services di account ini
             for (let svcIdx = 0; svcIdx < account.services.length; svcIdx++) {
                 const serviceId = account.services[svcIdx];
                 const smmLabel = account.label_prefix + ' ' + serviceId;
@@ -555,64 +549,54 @@
                 if (result.ok) {
                     addLog('SMM: ' + smmLabel + ' Order #' + result.order_id + ' [' + modeLabel + '] ✓', 'success');
                     successResult = result;
-                    // Note enrichment: kalau ada gagal sebelumnya, sebutkan
                     if (accountFailures.length > 0) {
                         const failedIds = accountFailures.map(f => f.id).join(',');
                         successResult.retry_note = 'Retry: ' + failedIds + ' failed @ ' + account.label_prefix;
                         logEvent('SMM RETRY');
                     } else if (failureReport.length > 0) {
-                        // Sukses tapi setelah fallback dari akun lain
                         const failedAccountsStr = failureReport.map(r => r.account + (r.skipped_reason ? '(' + r.skipped_reason + ')' : '')).join(', ');
                         successResult.retry_note = failedAccountsStr + ' → ' + account.label_prefix + ' OK';
                         logEvent('SMM RETRY');
                     }
-                    break; // exit service loop
+                    break;
                 }
 
                 addLog('SMM: ' + smmLabel + ' failed: ' + (result.error || 'unknown'), 'error');
                 accountFailures.push({ id: serviceId, msg: result.error || 'unknown' });
 
-                // Check account-level error → skip semua service di akun ini
                 if (isAccountLevelError(result.error)) {
                     const isApiKey = (result.error || '').toLowerCase().includes('api key');
                     accountSkipReason = isApiKey ? 'API Key salah' : 'saldo habis';
                     addLog('SMM: ' + account.label_prefix + ' → ' + accountSkipReason + ' detected, SKIP all services in this account', 'warning');
-                    break; // exit service loop, fallback ke akun lain
+                    break;
                 }
 
-                // Delay 500ms antar service attempt (anti race + ga bombardir API)
                 if (svcIdx < account.services.length - 1) {
                     await sleep(500);
                 }
             }
 
-            // Counter advance +1 per akun yang dicoba (fair distribution antar akun)
             counterAdvancedBy++;
 
             if (successResult) {
-                // Final counter advance
                 advanceSmmCounter(counterAdvancedBy);
                 return successResult;
             }
 
-            // Akun ini gagal, record ke failureReport
             failureReport.push({
                 account: account.label_prefix,
                 services: accountFailures,
                 skipped_reason: accountSkipReason
             });
 
-            // Delay 500ms sebelum coba akun berikutnya
             if (attempt < accounts.length - 1) {
                 await sleep(500);
             }
         }
 
-        // Semua akun habis dicoba, semua gagal
         advanceSmmCounter(counterAdvancedBy);
         logEvent('SMM ALL FAIL');
 
-        // Build error note: "All failed: IRFAN(saldo habis), JOVIE(66996:Layanan tidak tersedia)"
         const errorParts = failureReport.map(r => {
             if (r.skipped_reason) return r.account + '(' + r.skipped_reason + ')';
             const svcDetails = r.services.map(s => s.id + ':' + s.msg).join('|');
@@ -624,7 +608,7 @@
         return {
             ok: false,
             error: fullErrorMsg,
-            smm_panel: '', // empty karena ga ada yang sukses
+            smm_panel: '',
             all_failed: true,
             accounts_tried: accountsTried,
             total_accounts: accounts.length
@@ -634,6 +618,158 @@
     function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
     async function interruptibleSleep(ms) { const step = 100; let elapsed = 0; while (elapsed < ms) { if (shouldStop) return false; while (isPaused && !shouldStop) { markActivity(); await sleep(500); } if (shouldStop) return false; await sleep(Math.min(step, ms - elapsed)); elapsed += step; } return true; }
     function rand(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+
+    // ============================================================
+    // v73.4.0: NORMALIZER — semua variasi font komentar → ascii polos.
+    // Cukup tulis skip_keyword polos di TM_Config (mis: 'sumbu').
+    // ============================================================
+    const FB_NORM_EXTRA_MAP = {
+        '\u1D00':'a','\u0299':'b','\u1D04':'c','\u1D05':'d','\u1D07':'e','\uA730':'f','\u0262':'g','\u029C':'h','\u026A':'i','\u1D0A':'j',
+        '\u1D0B':'k','\u029F':'l','\u1D0D':'m','\u0274':'n','\u1D0F':'o','\u1D18':'p','\u01EB':'q','\u0280':'r','\uA731':'s','\u1D1B':'t',
+        '\u1D1C':'u','\u1D20':'v','\u1D21':'w','\u028F':'y','\u1D22':'z','\u0281':'r',
+        '\uD83C\uDD70':'a','\uD83C\uDD71':'b','\uD83C\uDD72':'c','\uD83C\uDD73':'d','\uD83C\uDD74':'e','\uD83C\uDD75':'f','\uD83C\uDD76':'g','\uD83C\uDD77':'h','\uD83C\uDD78':'i','\uD83C\uDD79':'j',
+        '\uD83C\uDD7A':'k','\uD83C\uDD7B':'l','\uD83C\uDD7C':'m','\uD83C\uDD7D':'n','\uD83C\uDD7E':'o','\uD83C\uDD7F':'p','\uD83C\uDD80':'q','\uD83C\uDD81':'r','\uD83C\uDD82':'s','\uD83C\uDD83':'t',
+        '\uD83C\uDD84':'u','\uD83C\uDD85':'v','\uD83C\uDD86':'w','\uD83C\uDD87':'x','\uD83C\uDD88':'y','\uD83C\uDD89':'z',
+        '\uD83C\uDDE6':'a','\uD83C\uDDE7':'b','\uD83C\uDDE8':'c','\uD83C\uDDE9':'d','\uD83C\uDDEA':'e','\uD83C\uDDEB':'f','\uD83C\uDDEC':'g','\uD83C\uDDED':'h','\uD83C\uDDEE':'i','\uD83C\uDDEF':'j',
+        '\uD83C\uDDF0':'k','\uD83C\uDDF1':'l','\uD83C\uDDF2':'m','\uD83C\uDDF3':'n','\uD83C\uDDF4':'o','\uD83C\uDDF5':'p','\uD83C\uDDF6':'q','\uD83C\uDDF7':'r','\uD83C\uDDF8':'s','\uD83C\uDDF9':'t',
+        '\uD83C\uDDFA':'u','\uD83C\uDDFB':'v','\uD83C\uDDFC':'w','\uD83C\uDDFD':'x','\uD83C\uDDFE':'y','\uD83C\uDDFF':'z',
+        '\u0430':'a','\u0435':'e','\u043E':'o','\u0440':'p','\u0441':'c','\u0443':'y','\u0445':'x','\u0455':'s','\u0456':'i','\u0458':'j','\u043C':'m','\u0442':'t','\u0432':'b','\u043D':'h','\u043A':'k',
+        '\u0410':'a','\u0415':'e','\u041E':'o','\u0420':'p','\u0421':'c','\u0423':'y','\u0425':'x','\u041C':'m','\u0422':'t','\u0412':'b','\u041D':'h','\u041A':'k',
+        '\u03B1':'a','\u03BF':'o','\u03C1':'p','\u03B5':'e','\u03B9':'i','\u03BA':'k','\u03BD':'v','\u03C4':'t','\u03C5':'u','\u03C7':'x','\u03B3':'y','\u03C3':'o','\u03BC':'u',
+        '\u0391':'a','\u0392':'b','\u0395':'e','\u0396':'z','\u0397':'h','\u0399':'i','\u039A':'k','\u039C':'m','\u039D':'n','\u039F':'o','\u03A1':'p','\u03A4':'t','\u03A5':'y','\u03A7':'x',
+        '\u01C0':'l','\u0251':'a','\u0261':'g','\u0269':'i','\u027F':'r','\u0285':'l','\u03F2':'c','\u03F3':'j','\u0475':'v','\u0501':'d','\u051B':'q','\u051D':'w',
+        '\u0138':'k','\u017F':'s','\u0282':'s','\u0288':'t','\u0256':'d','\u0253':'b','\u0188':'c','\u0257':'d','\u0260':'g','\u0266':'h','\u026D':'l','\u0271':'m','\u0273':'n','\u01A5':'p','\u02A0':'q','\u028B':'v','\u01B4':'y','\u0225':'z',
+        '\uFF10':'0','\uFF11':'1','\uFF12':'2','\uFF13':'3','\uFF14':'4','\uFF15':'5','\uFF16':'6','\uFF17':'7','\uFF18':'8','\uFF19':'9',
+        '\u00BA':'o','\u2070':'0','\u2080':'0'
+    };
+
+    function normalizeText(input) {
+        if (!input) return '';
+        let s = String(input);
+        try { s = s.normalize('NFKC'); } catch (e) {}
+        let out = '';
+        for (const ch of s) out += (FB_NORM_EXTRA_MAP[ch] !== undefined) ? FB_NORM_EXTRA_MAP[ch] : ch;
+        s = out;
+        try { s = s.normalize('NFD').replace(/[\u0300-\u036f\u0483-\u0489\u1ab0-\u1aff\u20d0-\u20f0]/g, ''); } catch (e) {}
+        s = s.replace(/[\u200b-\u200f\u2060-\u206f\ufe00-\ufe0f\ufeff\u00ad]/g, '');
+        s = s.replace(/[\udb40-\udb43][\udc00-\udfff]/g, '');
+        s = s.toLowerCase();
+        s = s.replace(/[^a-z0-9]/g, '');
+        return s;
+    }
+
+    // ============================================================
+    // v73.4.0: SCAN COMMENT RANK
+    // 5x PageDown scan semua komentar UTAMA di DOM (visible/off-screen).
+    // Tiap skip_keyword (normalized) dicari di rank berapa.
+    // Return: { found, rankString, minRank, mainCount }
+    //   rankString: 'sumbu rank 10' | 'sumbu rank 10 | dono rank 5' | ''
+    //   minRank: rank terkecil dari keyword mana pun (0 = ga ketemu) → gate SMM
+    // ============================================================
+    const RANK_PAGEDOWN_COUNT = 5;
+    const RANK_WAIT_AFTER_SCROLL_MS = 1800;
+
+    function rankFindScroller(dialog) {
+        if (!dialog) return null;
+        const cands = [dialog];
+        try { dialog.querySelectorAll('div').forEach(d => cands.push(d)); } catch (e) {}
+        let best = null, bestH = 0;
+        for (const el of cands) {
+            if (el.scrollHeight - el.clientHeight <= 50) continue;
+            let ov = '';
+            try { const cs = getComputedStyle(el); ov = cs.overflowY + cs.overflow; } catch (e) {}
+            if (!/auto|scroll/.test(ov)) continue;
+            if (el.clientHeight > bestH) { best = el; bestH = el.clientHeight; }
+        }
+        return best;
+    }
+
+    async function rankPageDown(scroller) {
+        const before = scroller ? scroller.scrollTop : window.scrollY;
+        const target = scroller || document.body;
+        try { if (target.focus) target.focus(); } catch (e) {}
+        try {
+            const evt = new KeyboardEvent('keydown', { key: 'PageDown', code: 'PageDown', keyCode: 34, which: 34, bubbles: true, cancelable: true });
+            target.dispatchEvent(evt); document.dispatchEvent(evt);
+        } catch (e) {}
+        await sleep(150);
+        if (scroller) { if (scroller.scrollTop === before) scroller.scrollTop = before + Math.max(300, scroller.clientHeight - 80); }
+        else { try { window.scrollBy(0, window.innerHeight - 80); } catch (e) {} }
+        const after = scroller ? scroller.scrollTop : window.scrollY;
+        return Math.abs(after - before) > 5;
+    }
+
+    function rankScanMainComments(dialog) {
+        const scope = dialog || document;
+        const all = Array.from(scope.querySelectorAll('[role="article"]')).filter(a => {
+            const al = a.getAttribute('aria-label') || '';
+            if (!al.startsWith('Komentar oleh') && !al.startsWith('Comment by')) return false;
+            if (a.offsetParent === null && a.getBoundingClientRect().height === 0) return false;
+            return true;
+        });
+        const mains = [];
+        for (const a of all) {
+            let isReply = false, p = a.parentElement, d = 0;
+            while (p && d < 40) { if (p.getAttribute && p.getAttribute('role') === 'article') { isReply = true; break; } p = p.parentElement; d++; }
+            if (isReply) continue;
+            mains.push((a.innerText || a.textContent || ''));
+        }
+        return mains;
+    }
+
+    async function scanCommentRank() {
+        const skipKeywords = getSkipKeywords();
+        if (skipKeywords.length === 0) {
+            return { found: false, rankString: '', minRank: 0, mainCount: 0, details: 'no skip_keywords configured' };
+        }
+        const kwNorm = skipKeywords.map(k => ({ raw: (k || '').toString().trim(), norm: normalizeText(k) })).filter(k => k.norm.length > 0);
+        if (kwNorm.length === 0) return { found: false, rankString: '', minRank: 0, mainCount: 0, details: 'all keywords empty after normalize' };
+
+        const dialogs = getVisibleDialogs();
+        const dialog = dialogs.length > 0 ? dialogs[dialogs.length - 1] : null;
+        if (!dialog) return { found: false, rankString: '', minRank: 0, mainCount: 0, details: 'no dialog open' };
+
+        const scroller = rankFindScroller(dialog);
+        addLog('RankScan: mulai (kw=' + kwNorm.length + ', scroller=' + (scroller ? 'ok' : 'window') + ')', 'info');
+
+        const hits = {};
+        let lastMainCount = 0;
+
+        for (let round = 0; round <= RANK_PAGEDOWN_COUNT; round++) {
+            if (shouldStop) break;
+            if (round > 0) {
+                const moved = await rankPageDown(scroller);
+                await sleep(RANK_WAIT_AFTER_SCROLL_MS);
+                if (!moved) addLog('RankScan: PgDn #' + round + ' ga gerak (mentok?)', 'info');
+            }
+            const mains = rankScanMainComments(dialog);
+            lastMainCount = mains.length;
+            for (let ri = 0; ri < mains.length; ri++) {
+                const norm = normalizeText(mains[ri]);
+                for (const kw of kwNorm) {
+                    if (hits[kw.raw] !== undefined) continue;
+                    if (norm.includes(kw.norm)) hits[kw.raw] = ri + 1;
+                }
+            }
+            if (Object.keys(hits).length >= kwNorm.length) { addLog('RankScan: semua keyword ketemu, stop di round ' + round, 'info'); break; }
+        }
+
+        const parts = [];
+        let minRank = 0;
+        for (const kw of kwNorm) {
+            if (hits[kw.raw] !== undefined) {
+                parts.push(kw.raw + ' rank ' + hits[kw.raw]);
+                if (minRank === 0 || hits[kw.raw] < minRank) minRank = hits[kw.raw];
+            }
+        }
+        const rankString = parts.join(' | ');
+        if (parts.length > 0) {
+            addLog('RankScan: HIT → ' + rankString + ' (minRank=' + minRank + ', scanned ' + lastMainCount + ' komentar utama)', 'success');
+            return { found: true, rankString: rankString, minRank: minRank, mainCount: lastMainCount, details: rankString };
+        }
+        addLog('RankScan: tidak ada keyword ketemu (' + lastMainCount + ' komentar utama)', 'info');
+        return { found: false, rankString: '', minRank: 0, mainCount: lastMainCount, details: 'not found in ' + lastMainCount + ' comments' };
+    }
 
     const SETTINGS = { SCROLL_STEP_MIN_PX: 800, SCROLL_STEP_MAX_PX: 1500, SCROLL_PAUSE_MIN_MS: 1200, SCROLL_PAUSE_MAX_MS: 2800, READ_BEFORE_LIKE_MIN_MS: 1500, READ_BEFORE_LIKE_MAX_MS: 3000, BETWEEN_POSTS_MIN_MS: 1800, BETWEEN_POSTS_MAX_MS: 3500, MAX_PASSES: 2, LIKE_WAIT_MS: 500, MIN_VIEWPORT_VISIBILITY_PERCENT: 60, SCROLL_TO_POST_MS: 1200, SCROLL_OFFSET_FROM_TOP: 120, CONTENT_WAIT_MS: 800 };
     function randMs(minKey, maxKey) { return rand(SETTINGS[minKey], SETTINGS[maxKey]); }
@@ -648,7 +784,7 @@
     function pruneOldLogs() { const cutoff = Date.now() - LOG_RETENTION_MS; const before = logMessages.length; while (logMessages.length > 0 && logMessages[logMessages.length - 1].ts < cutoff) logMessages.pop(); if (logMessages.length !== before) renderLogPanel(); }
     setInterval(pruneOldLogs, 60000);
 
-    function renderLogPanel() { try { const logBox = document.getElementById('fbs-log-box'); if (!logBox) return; if (logMessages.length === 0) { logBox.innerHTML = '<div style="color:#666;font-size:9px;text-align:center;padding:8px;">(no events)</div>'; return; } const colors = { 'SCROLL': '#b0b3b8', 'CAPTURE LINK': '#1877f2', 'SUCCESS POST': '#42b72a', 'LINK DEDUP': '#ff77ff', 'SKIP TOP2 KW': '#9c27b0', 'SKIP TOP2 OWN': '#ff6b35', 'NOT FOUND': '#ffaa00', 'DAILY RESET 00:00 WIB': '#00d0d0', 'SCRAPER STARTED': '#42b72a', 'VIRAL SAVED': '#ff6b35', 'VIRAL DUP': '#ff77ff', 'SKIP REEL': '#888888', 'SMM RETRY': '#9c27b0', 'SMM ALL FAIL': '#e41e3f' }; const icons = { 'SCROLL': '\uD83D\uDCDC', 'CAPTURE LINK': '\uD83D\uDD17', 'SUCCESS POST': '\u2705', 'LINK DEDUP': '\uD83D\uDD01', 'SKIP TOP2 KW': '\u26D4', 'SKIP TOP2 OWN': '\uD83D\uDE4B', 'NOT FOUND': '\u274C', 'DAILY RESET 00:00 WIB': '\uD83D\uDD04', 'SCRAPER STARTED': '\uD83D\uDE80', 'VIRAL SAVED': '\uD83D\uDD25', 'VIRAL DUP': '\uD83D\uDD01', 'SKIP REEL': '\uD83C\uDFAC', 'SMM RETRY': '\uD83D\uDD04', 'SMM ALL FAIL': '\uD83D\uDED1' }; const html = logMessages.slice(0, 10).map(m => { const color = colors[m.eventType] || '#e4e6eb'; const icon = icons[m.eventType] || '\u2022'; return '<div style="display:flex;justify-content:space-between;font-size:9px;padding:2px 4px;border-bottom:1px solid #2d2f33;"><span style="color:' + color + ';">' + icon + ' ' + m.eventType + '</span><span style="color:#666;">' + m.time + '</span></div>'; }).join(''); logBox.innerHTML = html; } catch (e) {} }
+    function renderLogPanel() { try { const logBox = document.getElementById('fbs-log-box'); if (!logBox) return; if (logMessages.length === 0) { logBox.innerHTML = '<div style="color:#666;font-size:9px;text-align:center;padding:8px;">(no events)</div>'; return; } const colors = { 'SCROLL': '#b0b3b8', 'CAPTURE LINK': '#1877f2', 'SUCCESS POST': '#42b72a', 'LINK DEDUP': '#ff77ff', 'RANK FOUND': '#9c27b0', 'RANK SKIP': '#ff6b35', 'NOT FOUND': '#ffaa00', 'DAILY RESET 00:00 WIB': '#00d0d0', 'SCRAPER STARTED': '#42b72a', 'VIRAL SAVED': '#ff6b35', 'VIRAL DUP': '#ff77ff', 'SKIP REEL': '#888888', 'SMM RETRY': '#9c27b0', 'SMM ALL FAIL': '#e41e3f' }; const icons = { 'SCROLL': '\uD83D\uDCDC', 'CAPTURE LINK': '\uD83D\uDD17', 'SUCCESS POST': '\u2705', 'LINK DEDUP': '\uD83D\uDD01', 'RANK FOUND': '\uD83C\uDFAF', 'RANK SKIP': '\u26D4', 'NOT FOUND': '\u274C', 'DAILY RESET 00:00 WIB': '\uD83D\uDD04', 'SCRAPER STARTED': '\uD83D\uDE80', 'VIRAL SAVED': '\uD83D\uDD25', 'VIRAL DUP': '\uD83D\uDD01', 'SKIP REEL': '\uD83C\uDFAC', 'SMM RETRY': '\uD83D\uDD04', 'SMM ALL FAIL': '\uD83D\uDED1' }; const html = logMessages.slice(0, 10).map(m => { const color = colors[m.eventType] || '#e4e6eb'; const icon = icons[m.eventType] || '\u2022'; return '<div style="display:flex;justify-content:space-between;font-size:9px;padding:2px 4px;border-bottom:1px solid #2d2f33;"><span style="color:' + color + ';">' + icon + ' ' + m.eventType + '</span><span style="color:#666;">' + m.time + '</span></div>'; }).join(''); logBox.innerHTML = html; } catch (e) {} }
 
     function setPhase(phase, msg) { currentPhase = phase; if (msg) addLog('PHASE > ' + phase + ': ' + msg, 'phase'); updateUI(); }
     function isFBErrorVisible() { const candidates = document.querySelectorAll('span, div[role="button"], a[role="button"], button'); for (const el of candidates) { if (el.children.length > 3) continue; const text = (el.innerText || el.textContent || '').trim().toLowerCase(); if (text === 'memuat halaman' || text === 'reload page' || text === 'muat ulang' || text === 'coba lagi' || text === 'try again' || text === 'reload') { const rect = el.getBoundingClientRect(); if (rect.width === 0 || rect.height === 0) continue; try { const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden') continue; if (parseFloat(style.opacity) < 0.1) continue; } catch (e) {} return true; } } return false; }
@@ -706,94 +842,13 @@
     function extractUrlFromOpenDialog() { const dialogs = getVisibleDialogs(); if (dialogs.length === 0) return null; const dialog = dialogs[dialogs.length - 1]; const commentLinks = dialog.querySelectorAll('a[href*="comment_id="]'); for (const link of commentLinks) { const href = link.href || ''; if (href.includes('/share/')) continue; const cleaned = cleanUrl(href); if (urlHasIdentifier(cleaned)) return cleaned; } const directLinks = dialog.querySelectorAll('a[href]'); for (const link of directLinks) { const href = link.href || ''; if (!href || !isValidPostUrl(href) || href.includes('/share/')) continue; try { const u = new URL(href, window.location.origin); if (u.pathname === '/' || u.pathname === '') continue; } catch (e) { continue; } const cleaned = cleanUrl(href); if (urlHasIdentifier(cleaned)) return cleaned; } return null; }
 
     function getSkipKeywords() { return RUNTIME_CONFIG.skip_keywords.slice(); }
-    // v73.3.0: own comment list dari TM_Config (untuk cek apakah post sudah kita pesan sebelumnya)
-    function getOwnCommentList() { return RUNTIME_CONFIG.komentar.slice(); }
 
     // ============================================================
-    // v72.39.0: SIMPLIFIED KEYWORD CHECK — cek 2 komentar teratas
-    // v73.3.0: Dual filter:
-    //   1. skip_keywords match (substring, case-insensitive)
-    //   2. own komentar list match (substring, case-insensitive + trim)
-    // Per komentar (rank 1, lalu rank 2):
-    //   - cek skip_keyword dulu → kalau match: SKIP reason='keyword'
-    //   - cek own komentar list → kalau match: SKIP reason='own-comment'
-    //   - clean → lanjut ke rank berikutnya
+    // v73.4.0: extractUrlWithRetry — buka komentar, capture URL, lalu
+    // SCAN COMMENT RANK (5x PageDown). Return rankResult ke caller.
+    // GATE SMM diputuskan di extractOnePost, BUKAN di sini (beda dari v73.3.0
+    // yang skip di sini). Di sini kita cuma capture URL + rank, ga skip apa2.
     // ============================================================
-    function checkTop2CommentsForSkip() {
-        const skipKeywords = getSkipKeywords();
-        const ownComments = getOwnCommentList();
-        // Normalize own comments untuk match: trim + lowercase
-        const ownCommentsNorm = ownComments.map(c => (c || '').toString().trim().toLowerCase()).filter(c => c.length > 0);
-
-        if (skipKeywords.length === 0 && ownCommentsNorm.length === 0) {
-            return { found: false, reason: null, matched: null, rank: null, details: 'no skip_keywords + no own comments configured' };
-        }
-
-        const dialogs = getVisibleDialogs();
-        const scope = dialogs.length > 0 ? dialogs[dialogs.length - 1] : document;
-
-        // Query articles dengan aria-label komentar (sama dengan targeting.js)
-        const articles = Array.from(scope.querySelectorAll('[role="article"]'))
-            .filter(a => {
-                const al = a.getAttribute('aria-label') || '';
-                return al.startsWith('Komentar oleh') || al.startsWith('Comment by');
-            })
-            .filter(a => {
-                const r = a.getBoundingClientRect();
-                return r.width > 0 && r.height > 0;
-            });
-
-        if (articles.length === 0) {
-            addLog('Top2Check: no comment articles found in dialog', 'info');
-            return { found: false, reason: null, matched: null, rank: null, details: 'no articles (0)' };
-        }
-
-        addLog('Top2Check: found ' + articles.length + ' comment articles, checking top 2 (kw=' + skipKeywords.length + ', own=' + ownCommentsNorm.length + ')', 'info');
-
-        const top2 = articles.slice(0, 2);
-        for (let i = 0; i < top2.length; i++) {
-            const art = top2[i];
-            const text = (art.textContent || '').toLowerCase();
-            const al = art.getAttribute('aria-label') || '';
-            const commenter = al.replace(/^Komentar oleh\s+/, '').replace(/^Comment by\s+/, '').substring(0, 40);
-
-            // STEP 1: skip_keyword check (substring match, case-insensitive)
-            for (const kw of skipKeywords) {
-                const kwNorm = kw.toLowerCase();
-                if (text.includes(kwNorm)) {
-                    addLog('Top2Check: MATCH KEYWORD rank #' + (i + 1) + ' by "' + commenter + '" keyword="' + kw + '"', 'skip');
-                    return {
-                        found: true,
-                        reason: 'keyword',
-                        matched: kw,
-                        rank: i + 1,
-                        details: 'rank #' + (i + 1) + ' by "' + commenter + '" keyword="' + kw + '"'
-                    };
-                }
-            }
-
-            // STEP 2: own comment list check (substring match, case-insensitive + trim)
-            for (const ownKom of ownCommentsNorm) {
-                if (text.includes(ownKom)) {
-                    // Truncate display untuk log clarity
-                    const ownDisp = ownKom.length > 40 ? ownKom.substring(0, 40) + '...' : ownKom;
-                    addLog('Top2Check: MATCH OWN COMMENT rank #' + (i + 1) + ' by "' + commenter + '" own="' + ownDisp + '"', 'skip');
-                    return {
-                        found: true,
-                        reason: 'own-comment',
-                        matched: ownDisp,
-                        rank: i + 1,
-                        details: 'rank #' + (i + 1) + ' by "' + commenter + '" own="' + ownDisp + '"'
-                    };
-                }
-            }
-
-            addLog('Top2Check: rank #' + (i + 1) + ' by "' + commenter + '" — clean', 'info');
-        }
-
-        return { found: false, reason: null, matched: null, rank: null, details: 'top 2 clean (' + articles.length + ' total articles)' };
-    }
-
     async function extractUrlWithRetry(post, advertiser) {
         const MAX_ATTEMPTS = 3; const URL_WAIT_MS = 4000; const URL_POLL_INTERVAL = 100;
         let commentCount = 0;
@@ -813,16 +868,12 @@
                 if (shouldStop) { await closeCommentModal(); return null; }
                 const currentUrl = window.location.href;
                 if (currentUrl !== urlBefore && isValidPostUrl(currentUrl)) {
-                    // Simpan URL pertama yang valid (sebelum FB SPA rewrite)
                     const firstValidUrl = currentUrl;
                     await sleep(300);
                     const reReadUrl = window.location.href;
-                    // Validasi ulang setelah sleep — FB SPA kadang rewrite balik ke permalink.php kosong
                     if (isValidPostUrl(reReadUrl)) {
-                        // Re-read masih valid, pakai versi terbaru (lebih lengkap)
                         capturedUrl = reReadUrl;
                     } else {
-                        // Re-read invalid (FB SPA rewrite) — fallback ke URL pertama yang valid
                         addLog('Extract: FB SPA rewrite ke URL invalid setelah 300ms, fallback ke URL pertama', 'warning');
                         capturedUrl = firstValidUrl;
                     }
@@ -833,52 +884,26 @@
             if (capturedUrl) { addLog('Extract: URL via navigation: ' + capturedUrl.substring(0, 70), 'info'); }
             else if (isDialogOpen()) { addLog('Extract: URL ga changed, scan DOM dari dialog...', 'info'); capturedUrl = extractUrlFromOpenDialog(); if (capturedUrl) addLog('Extract: URL via DOM scan: ' + capturedUrl.substring(0, 70), 'success'); else addLog('Extract: DOM scan tidak ketemu URL', 'warning'); }
             commentCount = 0;
+            let rankResult = { found: false, rankString: '', minRank: 0, mainCount: 0 };
             if (capturedUrl) {
                 addLog('Extract: tunggu modal fully loaded (max 30s)...', 'info');
                 const readyResult = await waitForCommentSectionReady();
-                // v73.1.0: Filter belumAda DIHAPUS — post tanpa komentar tetap lolos
-                // v73.1.0: Filter timeout-no-count DIHAPUS — post timeout tetap lolos
-                // v73.1.0: Filter min_comment_inbox DIHAPUS — semua count lolos
                 if (readyResult.belumAda) {
-                    addLog('Extract: "Belum ada komentar" detected, lanjut SAVE (no top2 check needed)', 'info');
+                    addLog('Extract: "Belum ada komentar" detected, lanjut (no rank scan needed)', 'info');
                 }
                 commentCount = readyResult.count || 0;
                 addLog('Extract: comment count = ' + commentCount + ' (source: ' + readyResult.reason + ')', 'info');
 
-                // v72.39.0: SIMPLIFIED KEYWORD CHECK — cek top 2 komentar
-                // v73.1.0: kalau count=0 (belum ada komentar / timeout) skip top2 check (no comments to check anyway)
-                // v73.3.0: dual filter — skip_keyword DAN own komentar list
+                // v73.4.0: SCAN RANK — cuma kalau ada komentar & ada skip_keyword
                 if (commentCount > 0) {
                     const skipKeywords = getSkipKeywords();
-                    const ownComments = getOwnCommentList();
-                    if (skipKeywords.length === 0 && ownComments.length === 0) {
-                        addLog('Extract: skip_keywords + own comments empty, langsung SAVE URL (count=' + commentCount + ')', 'info');
+                    if (skipKeywords.length === 0) {
+                        addLog('Extract: skip_keywords empty, skip rank scan (count=' + commentCount + ')', 'info');
                     } else {
-                        // Tunggu articles muncul di dialog
                         addLog('Extract: tunggu ' + (ARTICLE_SCAN_WAIT_MS/1000) + 's untuk articles load...', 'info');
                         await sleep(ARTICLE_SCAN_WAIT_MS);
-
-                        // Cek top 2 komentar (dual filter: keyword + own-comment)
-                        addLog('Extract: check top 2 comments (skip_kw=' + skipKeywords.length + ', own=' + ownComments.length + ')...', 'info');
-                        const top2Result = checkTop2CommentsForSkip();
-
-                        if (top2Result.found) {
-                            // v73.3.0: 2 reason yang mungkin (keyword / own-comment)
-                            if (top2Result.reason === 'keyword') {
-                                skippedKeyword++;
-                                logEvent('SKIP TOP2 KW');
-                                addLog('Extract: SKIP keyword "' + top2Result.matched + '" di ' + top2Result.details + ' (count=' + commentCount + ')', 'skip');
-                            } else if (top2Result.reason === 'own-comment') {
-                                skippedOwnComment++;
-                                logEvent('SKIP TOP2 OWN');
-                                addLog('Extract: SKIP own-comment "' + top2Result.matched + '" di ' + top2Result.details + ' (count=' + commentCount + ')', 'skip');
-                            }
-                            await closeCommentModal();
-                            await sleep(randDelay(1000, 2000));
-                            return { skipped: true, reason: top2Result.reason + '-found-top2', matchedKeyword: top2Result.matched, commentCount: commentCount };
-                        }
-
-                        addLog('Extract: top 2 clean (' + top2Result.details + '), lanjut SAVE (count=' + commentCount + ')', 'info');
+                        // 5x PageDown scan seluruh dialog
+                        rankResult = await scanCommentRank();
                     }
                 }
             }
@@ -886,15 +911,19 @@
             if (capturedUrl) {
                 if (capturedUrl === lastExtractedUrl) { addLog('Extract: same URL as previous post, retry...', 'warning'); continue; }
                 const finalUrl = cleanUrl(capturedUrl);
-                // FINAL GATE: pastikan URL punya identifier valid sebelum submit
-                // Cegah URL sampah seperti https://www.facebook.com/permalink.php (tanpa story_fbid/fbid)
                 if (!urlHasIdentifier(finalUrl)) {
                     addLog('Extract: REJECT URL tanpa identifier valid: ' + finalUrl + ' (retry)', 'warning');
                     continue;
                 }
-                addLog('Extract: captured = ' + capturedUrl.substring(0, 70) + ' | count=' + commentCount, 'success');
+                addLog('Extract: captured = ' + capturedUrl.substring(0, 70) + ' | count=' + commentCount + (rankResult.found ? ' | RANK: ' + rankResult.rankString : ''), 'success');
                 lastExtractedUrl = capturedUrl;
-                return { url: finalUrl, commentCount: commentCount };
+                return {
+                    url: finalUrl,
+                    commentCount: commentCount,
+                    rankFound: rankResult.found,
+                    rankString: rankResult.rankString,
+                    minRank: rankResult.minRank
+                };
             }
         }
         logEvent('NOT FOUND');
@@ -903,6 +932,12 @@
         return null;
     }
 
+    // ============================================================
+    // v73.4.0: extractOnePost — GATE SMM baru (urutan cek dari atas):
+    //   1. DEDUP (dedup-active)  → NO call comment, update rank di existing_row
+    //   2. NEW + minRank 1 / 2   → NO call comment, rank ditulis di row baru (via submit)
+    //   3. NEW + rank >=3 / not found → CALL comment + rank ditulis
+    // ============================================================
     async function extractOnePost(marker) {
         const post = findPostContainerFromMarker(marker);
         if (!post) { addLog('Post: container tidak ketemu dari marker', 'warning'); return { success: false }; }
@@ -931,40 +966,77 @@
 
         let shouldOrderSmm = false; let routedToViral = false;
 
-        if (extractResult && typeof extractResult === 'object' && extractResult.skipped) {
-            post.style.outline = '3px solid #9c27b0';
-            addLog('Post: SKIPPED (keyword: ' + extractResult.matchedKeyword + ', count=' + (extractResult.commentCount || 0) + ', reason=' + extractResult.reason + ') "' + advertiser + '"', 'info'); updateUI();
-        } else if (!extractResult) { post.style.outline = '3px dashed #ffaa00'; addLog('Post: EXTRACT-FAIL "' + advertiser + '"', 'warning');
+        if (!extractResult) { post.style.outline = '3px dashed #ffaa00'; addLog('Post: EXTRACT-FAIL "' + advertiser + '"', 'warning');
         } else {
             const cleanedUrl = extractResult.url; const commentCount = extractResult.commentCount || 0; const isReel = cleanedUrl.indexOf('/reel/') !== -1;
+            const rankFound = extractResult.rankFound === true;
+            const rankString = extractResult.rankString || '';
+            const minRank = extractResult.minRank || 0;
+
             if (isReel && !RUNTIME_CONFIG.scraper.include_reels) { skippedReels++; post.style.outline = '2px dotted #888'; logEvent('SKIP REEL'); addLog('Post: SKIP REEL (include_reels=false) "' + advertiser + '"', 'info'); updateUI(); return { success: false }; }
             const minCommentViral = RUNTIME_CONFIG.scraper.min_comment_viral;
             const isViralCandidate = commentCount >= minCommentViral;
-            addLog('Post: URL final = ' + cleanedUrl.substring(0, 70) + ' | count=' + commentCount + (isReel ? ' | type=REEL' : '') + (isViralCandidate ? ' | type=VIRAL (>=' + minCommentViral + ')' : ''), 'info');
-            if (isReel && commentCount >= minCommentViral) addLog('Post: REEL viral-count detected (count=' + commentCount + ') tapi REEL > force INBOX-only route', 'info');
-            if (commentCount === 0) addLog('Post: commentCount=0 > INBOX only', 'warning');
-            else if (isReel) addLog('Post: REEL > INBOX only (count=' + commentCount + ')', 'info');
-            else if (isViralCandidate) addLog('Post: VIRAL DUAL-WRITE (count=' + commentCount + ' >= ' + minCommentViral + ') > INBOX+SMM lalu Viral_History', 'success');
-            else addLog('Post: INBOX route (count=' + commentCount + ' < ' + minCommentViral + ')', 'info');
 
-            const sheetResult = await submitToSheet({ url: cleanedUrl }, isViralCandidate);
+            // v73.4.0: GATE — apakah rank 1/2 (block SMM order)?
+            const isTopRank = rankFound && (minRank === 1 || minRank === 2);
+
+            addLog('Post: URL final = ' + cleanedUrl.substring(0, 70) + ' | count=' + commentCount + (isReel ? ' | REEL' : '') + (isViralCandidate ? ' | VIRAL' : '') + (rankFound ? ' | RANK:' + rankString + ' (minRank=' + minRank + (isTopRank ? ',TOP→no order' : ',order') + ')' : ' | no rank'), 'info');
+
+            // === SUBMIT ke sheet (bawa comment_rank sekalian) ===
+            // GAS: kalau new → tulis rank di row baru. kalau dedup-active → tulis rank di existing_row.
+            const sheetResult = await submitToSheet({ url: cleanedUrl, comment_rank: rankString }, isViralCandidate);
+
             if (sheetResult.ok && sheetResult.status === 'new') {
-                collectedLinks.push({ url: cleanedUrl, advertiser: advertiser, cta: cta.text, timestamp: new Date().toISOString(), row: sheetResult.row, comment_count: commentCount });
+                collectedLinks.push({ url: cleanedUrl, advertiser: advertiser, cta: cta.text, timestamp: new Date().toISOString(), row: sheetResult.row, comment_count: commentCount, rank: rankString });
                 saveLinks(); post.style.outline = '3px solid #42b72a'; logEvent('SUCCESS POST');
-                addLog('Post: SAVED #' + collectedLinks.length + ' "' + advertiser + '"', 'success'); flashNotification('OK ' + advertiser); linksSinceLastDelay++; shouldOrderSmm = true; updateUI();
-            } else if (sheetResult.ok && sheetResult.status === 'duplicate') { skippedDuplicate++; post.style.outline = '3px solid #ff77ff'; logEvent('LINK DEDUP'); addLog('Post: DUPLICATE (row #' + sheetResult.row + ') "' + advertiser + '"', 'info'); updateUI();
-            } else if (!sheetResult.ok && sheetResult.reason === 'dedup-active') { skippedDuplicate++; post.style.outline = '3px solid #ff77ff'; logEvent('LINK DEDUP'); addLog('Post: DEDUP-ACTIVE (row #' + sheetResult.existing_row + ') "' + advertiser + '"', 'info'); updateUI();
-            } else if (!sheetResult.ok && sheetResult.reason === 'dedup-viral') { skippedDuplicate++; post.style.outline = '3px solid #ff6b35'; logEvent('VIRAL DUP'); addLog('Post: DEDUP-VIRAL (URL existing di Viral_History row #' + sheetResult.existing_row + ') "' + advertiser + '"', 'info'); updateUI();
-            } else { post.style.outline = '3px dashed #ffaa00'; addLog('Post: SHEET-ERROR (' + (sheetResult.reason || 'unknown') + ') "' + advertiser + '"', 'warning'); }
+                addLog('Post: SAVED #' + collectedLinks.length + ' "' + advertiser + '"' + (rankFound ? ' [' + rankString + ']' : ''), 'success'); flashNotification('OK ' + advertiser); linksSinceLastDelay++; updateUI();
 
+                if (rankFound) { rankFoundCount++; logEvent('RANK FOUND'); }
+
+                // GATE: NEW + rank 1/2 → NO order SMM (rank udah ketulis via submit)
+                if (isTopRank) {
+                    rankSkipCount++; logEvent('RANK SKIP');
+                    post.style.outline = '3px solid #9c27b0';
+                    addLog('Post: NEW tapi rank ' + minRank + ' (TOP) → NO SMM order, rank tersimpan (' + rankString + ')', 'skip');
+                    shouldOrderSmm = false;
+                } else {
+                    // NEW + rank>=3 / not found → order SMM
+                    shouldOrderSmm = true;
+                }
+                updateUI();
+            } else if (!sheetResult.ok && sheetResult.reason === 'dedup-active') {
+                // DEDUP → NO call comment. Rank sudah ditulis GAS via submit (kalau rankString ada).
+                skippedDuplicate++; post.style.outline = '3px solid #ff77ff'; logEvent('LINK DEDUP');
+                if (rankFound) {
+                    rankFoundCount++; logEvent('RANK FOUND');
+                    if (!sheetResult.rank_written && sheetResult.existing_row) {
+                        // fallback: kalau GAS ga nulis rank (mis rankString kosong pas submit), update terpisah
+                        await updateCommentRank(sheetResult.existing_row, rankString);
+                    }
+                    addLog('Post: DEDUP-ACTIVE (row #' + sheetResult.existing_row + ') → rank updated [' + rankString + '] "' + advertiser + '"', 'info');
+                } else {
+                    addLog('Post: DEDUP-ACTIVE (row #' + sheetResult.existing_row + ') → no rank found "' + advertiser + '"', 'info');
+                }
+                shouldOrderSmm = false; updateUI();
+            } else if (!sheetResult.ok && sheetResult.reason === 'dedup-viral') {
+                skippedDuplicate++; post.style.outline = '3px solid #ff6b35'; logEvent('VIRAL DUP'); addLog('Post: DEDUP-VIRAL (row #' + sheetResult.existing_row + ') "' + advertiser + '"', 'info'); shouldOrderSmm = false; updateUI();
+            } else if (sheetResult.ok && sheetResult.status === 'duplicate') {
+                skippedDuplicate++; post.style.outline = '3px solid #ff77ff'; logEvent('LINK DEDUP'); addLog('Post: DUPLICATE (row #' + sheetResult.row + ') "' + advertiser + '"', 'info'); shouldOrderSmm = false; updateUI();
+            } else { post.style.outline = '3px dashed #ffaa00'; addLog('Post: SHEET-ERROR (' + (sheetResult.reason || 'unknown') + ') "' + advertiser + '"', 'warning'); shouldOrderSmm = false; }
+
+            // === ORDER SMM (cuma kalau shouldOrderSmm true = NEW + rank>=3/notfound) ===
             if (shouldOrderSmm) {
+                if (commentCount === 0) addLog('Post: commentCount=0 → INBOX only', 'warning');
+                else if (isReel) addLog('Post: REEL → INBOX only (count=' + commentCount + ')', 'info');
+                else if (isViralCandidate) addLog('Post: VIRAL DUAL-WRITE (count=' + commentCount + ' >= ' + minCommentViral + ')', 'success');
+                else addLog('Post: INBOX route (count=' + commentCount + ' < ' + minCommentViral + ')', 'info');
+
                 const comments = getCommentsList();
                 if (comments.length < 5) { addLog('SMM: comments < 5, skip order', 'warning'); }
                 else {
                     await sleep(800);
                     const orderResult = await submitOrderToSMM(cleanedUrl, isViralCandidate);
                     if (orderResult.ok) {
-                        // v73.2.0: kalau ada retry_note (sukses setelah fallback), kirim ke sheet kolom Note
                         const noteForSheet = orderResult.retry_note || '';
                         await updateSheetStatus(sheetResult.row, 'Proses', orderResult.order_id, noteForSheet, orderResult.smm_panel);
                         addLog('Order: "' + advertiser + '" #' + orderResult.order_id + ' (' + orderResult.smm_panel + ')' + (orderResult.retry_note ? ' [' + orderResult.retry_note + ']' : ''), 'success');
@@ -973,15 +1045,16 @@
                         addLog('Order: "' + advertiser + '" failed: ' + orderResult.error, 'error');
                     }
                 }
-            }
 
-            if (isViralCandidate && sheetResult.ok && sheetResult.status === 'new') {
-                await sleep(500); addLog('Post: STEP 3 - DUAL-WRITE submit Viral_History...', 'info');
-                const viralResult = await submitToViralHistory(cleanedUrl, commentCount, true);
-                if (viralResult.ok && viralResult.status === 'new') { viralSavedCount++; routedToViral = true; post.style.outline = '3px solid #ff6b35'; logEvent('VIRAL SAVED'); addLog('Post: VIRAL SAVED #' + viralSavedCount + ' "' + advertiser + '" (Viral row #' + viralResult.row + ')', 'success'); flashNotification('VIRAL ' + advertiser); updateUI();
-                } else if (!viralResult.ok && viralResult.reason === 'duplicate') { viralDupCount++; logEvent('VIRAL DUP'); addLog('Post: VIRAL DUP (existing Viral row #' + viralResult.existing_row + ')', 'info'); updateUI();
-                } else { addLog('Post: VIRAL DUAL-WRITE failed: ' + (viralResult.error || viralResult.reason) + ' "' + advertiser + '"', 'warning'); }
-            } else if (isViralCandidate) { addLog('Post: SKIP Viral dual-write (Inbox not NEW, status: ' + (sheetResult.status || sheetResult.reason) + ')', 'info'); }
+                // Viral dual-write (cuma buat NEW + order path)
+                if (isViralCandidate && sheetResult.ok && sheetResult.status === 'new') {
+                    await sleep(500); addLog('Post: DUAL-WRITE submit Viral_History...', 'info');
+                    const viralResult = await submitToViralHistory(cleanedUrl, commentCount, true);
+                    if (viralResult.ok && viralResult.status === 'new') { viralSavedCount++; routedToViral = true; post.style.outline = '3px solid #ff6b35'; logEvent('VIRAL SAVED'); addLog('Post: VIRAL SAVED #' + viralSavedCount + ' "' + advertiser + '" (row #' + viralResult.row + ')', 'success'); flashNotification('VIRAL ' + advertiser); updateUI();
+                    } else if (!viralResult.ok && viralResult.reason === 'duplicate') { viralDupCount++; logEvent('VIRAL DUP'); addLog('Post: VIRAL DUP (row #' + viralResult.existing_row + ')', 'info'); updateUI();
+                    } else { addLog('Post: VIRAL DUAL-WRITE failed: ' + (viralResult.error || viralResult.reason) + ' "' + advertiser + '"', 'warning'); }
+                }
+            }
         }
         return { success: shouldOrderSmm || routedToViral };
     }
@@ -1017,7 +1090,7 @@
                 setPhase('waiting', 'Waiting content load'); await interruptibleSleep(SETTINGS.CONTENT_WAIT_MS);
             }
         } catch (e) { addLog('Main: loop exception: ' + e.message + ' > tutup modal, lanjut', 'error'); errorRecoveryCount++; try { if (isDialogOpen()) await closeDialogForce(); } catch (err) {} addLog('WOULD REFRESH: loop-exception (disabled, scraper stopped)', 'error');
-        } finally { stopWatchdog(); if (isDialogOpen()) await closeDialogForce(); mainLoopRunning = false; isPaused = false; setPhase('idle', 'Stopped'); addLog('Main: stopped, stats: detected=' + detectedCount + ' inbox=' + collectedLinks.length + ' viral=' + viralSavedCount + ' dup=' + skippedDuplicate + ' skip-kw=' + skippedKeyword + ' skip-own=' + skippedOwnComment + ' skip-reel=' + skippedReels, 'info'); }
+        } finally { stopWatchdog(); if (isDialogOpen()) await closeDialogForce(); mainLoopRunning = false; isPaused = false; setPhase('idle', 'Stopped'); addLog('Main: stopped, stats: detected=' + detectedCount + ' inbox=' + collectedLinks.length + ' viral=' + viralSavedCount + ' dup=' + skippedDuplicate + ' rank-found=' + rankFoundCount + ' rank-skip=' + rankSkipCount + ' skip-reel=' + skippedReels, 'info'); }
     }
 
     function stopMainLoop() { shouldStop = true; isPaused = false; stopWatchdog(); GM_setValue(AUTO_RESUME_KEY, ''); addLog('Main: STOP requested', 'info'); }
@@ -1053,12 +1126,12 @@
         + '#fb-scraper-panel .fbs-row .fbs-btn { margin-bottom: 0; }'
         + '#fb-scraper-panel .fbs-toast { position: fixed; bottom: 20px; right: 20px; background: #42b72a; color: white; padding: 10px 16px; border-radius: 6px; font-weight: 600; z-index: 2147483647; }'
         + '</style>'
-        + '<div class="fbs-header" id="fbs-header"><span class="fbs-title">FB Scraper v73.3.0</span><button class="fbs-mini-btn" id="fbs-minimize">_</button></div>'
+        + '<div class="fbs-header" id="fbs-header"><span class="fbs-title">FB Scraper v73.4.0</span><button class="fbs-mini-btn" id="fbs-minimize">_</button></div>'
         + '<div class="fbs-body">'
         + '<div class="fbs-saved-box"><div class="fbs-saved-num" id="fbs-stat-count">0</div><div class="fbs-saved-label">Link Inbox Tersimpan</div></div>'
-        + '<div class="fbs-stats-row"><div class="fbs-stat-cell"><div class="num" id="fbs-stat-detected" style="color:#42b72a;">0</div><div class="lbl">Detected</div></div><div class="fbs-stat-cell"><div class="num" id="fbs-stat-dup" style="color:#ff77ff;">0</div><div class="lbl">Inbox Dup</div></div></div>'
+        + '<div class="fbs-stats-row"><div class="fbs-stat-cell"><div class="num" id="fbs-stat-detected" style="color:#42b72a;">0</div><div class="lbl">Detected</div></div><div class="fbs-stat-cell"><div class="num" id="fbs-stat-dup" style="color:#ff77ff;">0</div><div class="lbl">Dedup</div></div></div>'
         + '<div class="fbs-stats-row"><div class="fbs-stat-cell"><div class="num" id="fbs-stat-viral-saved" style="color:#ff6b35;">0</div><div class="lbl">Viral Saved</div></div><div class="fbs-stat-cell"><div class="num" id="fbs-stat-viral-dup" style="color:#ff77ff;">0</div><div class="lbl">Viral Dup</div></div></div>'
-        + '<div class="fbs-stats-row"><div class="fbs-stat-cell"><div class="num" id="fbs-stat-skip-kw" style="color:#9c27b0;">0</div><div class="lbl">Skip KW</div></div><div class="fbs-stat-cell"><div class="num" id="fbs-stat-skip-own" style="color:#ff6b35;">0</div><div class="lbl">Skip Own</div></div></div>'
+        + '<div class="fbs-stats-row"><div class="fbs-stat-cell"><div class="num" id="fbs-stat-rank-found" style="color:#9c27b0;">0</div><div class="lbl">Rank Found</div></div><div class="fbs-stat-cell"><div class="num" id="fbs-stat-rank-skip" style="color:#ff6b35;">0</div><div class="lbl">Rank 1/2 Skip</div></div></div>'
         + '<div class="fbs-stats-row"><div class="fbs-stat-cell"><div class="num" id="fbs-stat-skip-reel" style="color:#888;">0</div><div class="lbl">Skip Reel</div></div><div class="fbs-stat-cell"><div class="num">&nbsp;</div><div class="lbl">&nbsp;</div></div></div>'
         + '<div id="fbs-mode-box" style="background:#1c1e21;border:1px solid #3a3b3c;border-radius:6px;padding:6px 8px;margin-bottom:8px;text-align:center;font-size:10px;"><div id="fbs-mode-status" style="color:#42b72a;font-weight:700;">FEED idle</div></div>'
         + '<div id="fbs-config-box" style="background:#0d1f3a;border:1px solid #1877f2;border-radius:6px;padding:8px;margin-bottom:8px;font-size:10px;"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><span style="font-weight:700;color:#1877f2;">CONFIG (sheet)</span><button id="fbs-config-refresh" style="background:#1877f2;color:white;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-weight:700;font-size:10px;">Refresh</button></div><div id="fbs-config-status" style="color:#b0b3b8;font-size:9px;line-height:1.5;">Loading...</div></div>'
@@ -1109,7 +1182,7 @@
         document.getElementById('fbs-btn-pause').addEventListener('click', () => togglePause());
         document.getElementById('fbs-btn-clear').addEventListener('click', () => {
             if (confirm('Hapus ' + collectedLinks.length + ' link?')) {
-                clearLinks(); logMessages = []; detectedCount = 0; scrollAttempts = 0; skippedNoCTA = 0; skippedExcluded = 0; skippedKeyword = 0; skippedOwnComment = 0; skippedDuplicate = 0; skippedReels = 0; viralSavedCount = 0; viralDupCount = 0; linksSinceLastDelay = 0; retryCount = 0; errorRecoveryCount = 0; lastExtractedUrl = null;
+                clearLinks(); logMessages = []; detectedCount = 0; scrollAttempts = 0; skippedNoCTA = 0; skippedExcluded = 0; rankFoundCount = 0; rankSkipCount = 0; skippedDuplicate = 0; skippedReels = 0; viralSavedCount = 0; viralDupCount = 0; linksSinceLastDelay = 0; retryCount = 0; errorRecoveryCount = 0; lastExtractedUrl = null;
                 document.querySelectorAll('[data-fb-extracted], [data-fb-processing]').forEach(el => { el.removeAttribute('data-fb-extracted'); el.removeAttribute('data-fb-processing'); el.style.outline = ''; });
                 addLog('UI: cleared all stats + markers', 'info'); updateUI();
             }
@@ -1153,11 +1226,11 @@
             const viralDup = document.getElementById('fbs-stat-viral-dup');
             if (viralSaved) viralSaved.textContent = viralSavedCount;
             if (viralDup) viralDup.textContent = viralDupCount;
-            const skipKw = document.getElementById('fbs-stat-skip-kw');
-            const skipOwn = document.getElementById('fbs-stat-skip-own');
+            const rankFoundEl = document.getElementById('fbs-stat-rank-found');
+            const rankSkipEl = document.getElementById('fbs-stat-rank-skip');
             const skipReel = document.getElementById('fbs-stat-skip-reel');
-            if (skipKw) skipKw.textContent = skippedKeyword;
-            if (skipOwn) skipOwn.textContent = skippedOwnComment;
+            if (rankFoundEl) rankFoundEl.textContent = rankFoundCount;
+            if (rankSkipEl) rankSkipEl.textContent = rankSkipCount;
             if (skipReel) skipReel.textContent = skippedReels;
             const modeStatus = document.getElementById('fbs-mode-status');
             if (modeStatus) {
@@ -1179,7 +1252,6 @@
             if (configStatus && RUNTIME_CONFIG.loaded) {
                 const commentPanels = RUNTIME_CONFIG.smm_panels.filter(p => p.function === 'comment' && p.enabled).length;
                 const likePanels = RUNTIME_CONFIG.smm_panels.filter(p => p.function === 'like' && p.enabled).length;
-                // v73.2.0: tampilin jumlah akun aktif + total service combinations
                 const activeAccounts = buildActiveAccounts();
                 const totalServices = activeAccounts.reduce((sum, a) => sum + a.services.length, 0);
                 const ts = RUNTIME_CONFIG.last_fetch_ts ? new Date(RUNTIME_CONFIG.last_fetch_ts).toLocaleTimeString('id-ID', { hour12: false }) : '-';
@@ -1203,25 +1275,19 @@
         } catch (e) {}
     }
 
-    // Daily reset at 00:00 WIB
     function scheduleDailyReset() {
         function getNextMidnightWIB() {
-            // Hitung 00:00 WIB berikutnya dengan cara sederhana dan aman
             const now = Date.now();
-            const WIB_OFFSET_MS = 7 * 3600000; // UTC+7
+            const WIB_OFFSET_MS = 7 * 3600000;
             const DAY_MS = 86400000;
-            // Waktu WIB sekarang dalam ms sejak epoch
             const wibNowMs = now + WIB_OFFSET_MS;
-            // Ms yang sudah lewat sejak midnight WIB hari ini
             const msSinceMidnightWIB = wibNowMs % DAY_MS;
-            // Ms sampai midnight WIB berikutnya
             let msToNext = DAY_MS - msSinceMidnightWIB;
-            // Safety guard: kalau < 60 detik (edge case tepat di midnight), set 24 jam
             if (msToNext < 60000) msToNext = DAY_MS;
             return msToNext;
         }
         function doReset() {
-            detectedCount = 0; scrollAttempts = 0; skippedNoCTA = 0; skippedExcluded = 0; skippedKeyword = 0; skippedOwnComment = 0; skippedDuplicate = 0; skippedReels = 0; viralSavedCount = 0; viralDupCount = 0; linksSinceLastDelay = 0; retryCount = 0; errorRecoveryCount = 0;
+            detectedCount = 0; scrollAttempts = 0; skippedNoCTA = 0; skippedExcluded = 0; rankFoundCount = 0; rankSkipCount = 0; skippedDuplicate = 0; skippedReels = 0; viralSavedCount = 0; viralDupCount = 0; linksSinceLastDelay = 0; retryCount = 0; errorRecoveryCount = 0;
             logMessages = [];
             logEvent('DAILY RESET 00:00 WIB');
             addLog('Daily reset: all counters cleared', 'success');
@@ -1246,7 +1312,6 @@
     }
     checkAndReloadAfterNavigation();
 
-    // Init panel
     createPanel();
 
     } // end mainScript
