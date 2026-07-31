@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FB Sponsored Ads Link Scraper
 // @namespace    https://riko.local/fbscraper
-// @version      73.4.0
-// @description  v73.4.0 - Comment Rank scan: 5x PageDown scan seluruh dialog, cari tiap skip_keyword (normalized font) di rank berapa, tulis ke Inbox kolom P. Gate SMM: dedup=no call+update rank; rank 1/2=no call+update rank; rank>=3 / not found=CALL comment. v73.3.0 = Top 2 dual filter. v73.2.0 = SMM multi-service retry per akun.
+// @version      73.6.0
+// @description  v73.6.0 - ANCHOR BARU: deteksi iklan lewat data-ad-rendering-role=cta (CTA cuma nempel di iklan, gak di post biasa) — label Bersponsor gak lagi jadi syarat. FB nyelipin U+034F tiap huruf + class CSS acak, bikin decode label mustahil dikejar. Jalur label lama (aria-labelledby / exact / decoded) tetap jalan sebagai tambahan. v73.5.0 = marker aria-labelledby + container via comment_button. v73.4.0 = Comment Rank scan 5x PageDown, gate SMM rank 1/2. v73.3.0 = Top 2 dual filter.
 // @author       Riko
 // @match        *://*.facebook.com/*
 // @match        *://*.messenger.com/*
@@ -94,7 +94,7 @@
 
     function navigateToFeedRecover(reason) {
         try {
-            console.error('[FB Scraper v73.4.0] navigateToFeedRecover called outside mainScript scope: ' + reason);
+            console.error('[FB Scraper v73.6.0] navigateToFeedRecover called outside mainScript scope: ' + reason);
         } catch (e) {}
     }
 
@@ -102,7 +102,7 @@
     function scheduleGlobalErrorReload(reason) {
         try {
             globalErrorCount++;
-            console.warn('[FB Scraper v73.4.0] WOULD REFRESH (global-error, disabled): ' + reason + ' (total: ' + globalErrorCount + ')');
+            console.warn('[FB Scraper v73.6.0] WOULD REFRESH (global-error, disabled): ' + reason + ' (total: ' + globalErrorCount + ')');
         } catch (e) {}
     }
 
@@ -152,13 +152,13 @@
                 reason === 'fb-error-after-scroll'
             );
             if (allowRefresh) {
-                console.warn('[FB Scraper v73.4.0] REFRESH AKTIF: ' + reason);
+                console.warn('[FB Scraper v73.6.0] REFRESH AKTIF: ' + reason);
                 addLog('REFRESH: ' + reason, 'error');
                 GM_setValue(NEED_RELOAD_AFTER_NAV_KEY, '1');
                 GM_setValue(AUTO_RESUME_KEY, '1');
                 window.location.href = FEED_URL_V16;
             } else {
-                console.error('[FB Scraper v73.4.0] WOULD REFRESH (disabled): ' + reason);
+                console.error('[FB Scraper v73.6.0] WOULD REFRESH (disabled): ' + reason);
                 addLog('WOULD REFRESH: ' + reason + ' (disabled, lanjut scroll)', 'error');
             }
         } catch (e) {}
@@ -807,9 +807,89 @@
     }
 
     function findAllMarkers() { const found = []; const seenPosts = new Set(); const bersponsorMarkers = findBersponsorMarkers(); for (const marker of bersponsorMarkers) { const post = findPostContainerFromMarker(marker); if (!post) continue; if (seenPosts.has(post)) continue; seenPosts.add(post); found.push(marker); } return found; }
-    function findDecodedBersponsorMarkers() { const found = []; const candidates = document.querySelectorAll('span[dir="auto"], a[role="link"] span, span[aria-labelledby]'); for (const el of candidates) { const rect = el.getBoundingClientRect(); if (rect.width === 0 || rect.height === 0) continue; if (rect.width > 250 || rect.height > 35) continue; const allSpans = el.querySelectorAll('span'); if (allSpans.length < 3) continue; const charSpans = []; for (const sp of allSpans) { if (sp.children.length > 0) continue; const t = sp.textContent || ''; if (t.length === 0 || t.length > 3) continue; const sr = sp.getBoundingClientRect(); if (sr.width === 0 || sr.height === 0) continue; if (sr.left < rect.left - 5 || sr.right > rect.right + 5) continue; if (sr.top < rect.top - 5 || sr.bottom > rect.bottom + 5) continue; try { const cs = window.getComputedStyle(sp); if (cs.opacity === '0' || cs.visibility === 'hidden' || cs.display === 'none') continue; } catch (e) {} charSpans.push({ text: t, x: sr.left, y: sr.top }); } if (charSpans.length < 5) continue; charSpans.sort((a, b) => Math.abs(a.y - b.y) > 5 ? a.y - b.y : a.x - b.x); const decoded = charSpans.map(c => c.text).join(''); const lower = decoded.toLowerCase().replace(/\s/g, ''); if (lower.includes('bersponsor') || lower.includes('sponsored')) { if (isInsideComplementary(el)) continue; found.push(el); } } return found; }
-    function findBersponsorMarkers() { const found = []; const seen = new Set(); const candidates = document.querySelectorAll('span, a'); for (const el of candidates) { if (el.children.length > 50) continue; const text = (el.innerText || '').trim().toLowerCase().replace(/\s/g, ''); if (text !== 'bersponsor' && text !== 'sponsored' && text !== 'disponsori') continue; const rect = el.getBoundingClientRect(); if (rect.width === 0 || rect.height === 0) continue; try { const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden') continue; if (parseFloat(style.opacity) < 0.1) continue; } catch (e) { continue; } if (isInsideComplementary(el)) continue; found.push(el); seen.add(el); } const decoded = findDecodedBersponsorMarkers(); for (const el of decoded) { if (seen.has(el)) continue; found.push(el); seen.add(el); } return found; }
-    function findPostContainerFromMarker(marker) { if (!marker) return null; if (isInsideComplementary(marker)) return null; let el = marker; const levels = []; for (let i = 0; i < 40 && el && el !== document.body; i++) { levels.push(el); el = el.parentElement; } function isPostSized(el) { const r = el.getBoundingClientRect(); return r.width >= 400 && r.width <= 900 && r.height >= 200 && r.height <= 2500; } for (const lvl of levels) { if (lvl.getAttribute && lvl.getAttribute('role') === 'article' && isPostSized(lvl)) return lvl; } for (const lvl of levels) { const pl = lvl.getAttribute && lvl.getAttribute('data-pagelet'); if (pl && pl.includes('FeedUnit') && isPostSized(lvl)) return lvl; } for (const lvl of levels) { if (!lvl.querySelector || !isPostSized(lvl)) continue; const buttons = lvl.querySelectorAll('div[role="button"][aria-label]'); let hasInteractive = false; for (const btn of buttons) { const al = (btn.getAttribute('aria-label') || '').toLowerCase(); if (al.includes('bagikan') || al.includes('berbagi') || al.includes('share') || al === 'komentar' || al === 'comment' || al.startsWith('beri komentar') || al === 'suka' || al === 'beri reaksi' || al === 'like') { hasInteractive = true; break; } } if (hasInteractive) return lvl; } for (const lvl of levels) { if (lvl.querySelector && isPostSized(lvl) && lvl.querySelector('[data-ad-rendering-role*="cta" i]')) return lvl; } return null; }
+    function findDecodedBersponsorMarkers() { const found = []; const candidates = document.querySelectorAll('span[dir="auto"], a[role="link"] span, span[aria-labelledby]'); for (const el of candidates) { const rect = el.getBoundingClientRect(); if (rect.width === 0 || rect.height === 0) continue; if (rect.width > 250 || rect.height > 35) continue; const allSpans = el.querySelectorAll('span'); if (allSpans.length < 3) continue; const charSpans = []; for (const sp of allSpans) { if (sp.children.length > 0) continue; const t = sp.textContent || ''; if (t.length === 0 || t.length > 3) continue; const sr = sp.getBoundingClientRect(); if (sr.width === 0 || sr.height === 0) continue; if (sr.left < rect.left - 5 || sr.right > rect.right + 5) continue; if (sr.top < rect.top - 5 || sr.bottom > rect.bottom + 5) continue; try { const cs = window.getComputedStyle(sp); if (cs.opacity === '0' || cs.visibility === 'hidden' || cs.display === 'none') continue; } catch (e) {} charSpans.push({ text: t, x: sr.left, y: sr.top }); } if (charSpans.length < 5) continue; charSpans.sort((a, b) => Math.abs(a.y - b.y) > 5 ? a.y - b.y : a.x - b.x); const decoded = charSpans.map(c => c.text).join(''); let lower = decoded.toLowerCase(); try { lower = lower.normalize('NFKD'); } catch (e) {} /* v73.6.0: FB nyelipin U+034F (combining grapheme joiner) di belakang TIAP huruf -> tanpa dibuang, includes('bersponsor') selamanya false */ lower = lower.replace(/[\u0300-\u036f\u200b-\u200f\u2060-\u206f\ufe00-\ufe0f\ufeff\u00ad]/g, '').replace(/\s/g, ''); if (lower.includes('bersponsor') || lower.includes('sponsored')) { if (isInsideComplementary(el)) continue; found.push(el); } } return found; }
+    // ============================================================
+    // v73.5.0: JALUR UTAMA BARU — aria-labelledby lookup.
+    // FB sekarang naruh teks "Bersponsor" BERSIH di <span id="_r_xxx_"> yg
+    // display:none, dan diportal KELUAR container post (depth 3 dari body).
+    // Elemen yg keliatan di layar cuma decoy (isinya karakter acak +
+    // newline), jadi decode geometrik findDecodedBersponsorMarkers() GAGAL.
+    // Tapi elemen visible itu punya aria-labelledby="_r_xxx_" yg nunjuk
+    // lurus ke teks bersih → lookup by id = 100% tembus & jauh lebih stabil.
+    // ============================================================
+    function findAriaLabelledbySponsorMarkers() {
+        const found = [];
+        const candidates = document.querySelectorAll('[aria-labelledby]');
+        for (const el of candidates) {
+            const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/);
+            let isSponsor = false;
+            for (const id of ids) {
+                if (!id) continue;
+                let ref = null;
+                try { ref = document.getElementById(id); } catch (e) { continue; }
+                if (!ref) continue;
+                const refText = (ref.textContent || '').trim().toLowerCase().replace(/\s/g, '');
+                if (refText === 'bersponsor' || refText === 'sponsored' || refText === 'disponsori') { isSponsor = true; break; }
+            }
+            if (!isSponsor) continue;
+            // elemen VISIBLE + ukuran label (bukan container gede yg kebetulan ke-label)
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+            if (rect.width > 300 || rect.height > 40) continue;
+            try { const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden') continue; if (parseFloat(style.opacity) < 0.1) continue; } catch (e) { continue; }
+            if (isInsideComplementary(el)) continue;
+            found.push(el);
+        }
+        return found;
+    }
+
+    // v73.5.0: 3 jalur berurutan + dedup Set.
+    //   1) aria-labelledby  → cara FB SEKARANG
+    //   2) exact innerText  → cara lama (DIPERTAHANKAN, fallback)
+    //   3) decode geometrik → cara lama (DIPERTAHANKAN, fallback)
+    // Kalau FB balik ke cara lama, jalur 2/3 tetap nangkep = zero regression.
+        // ============================================================
+    // v73.6.0: ANCHOR UTAMA BARU — data-ad-rendering-role="cta".
+    // Alasan: hasCTA() udah jadi GATE WAJIB di extractOnePost (no CTA = skip),
+    // jadi nyari label "Bersponsor" duluan itu kerja dua kali buat hasil sama.
+    // Terbukti di feed: cta=1 vs comment_button=3 → CTA cuma nempel di IKLAN.
+    // Jauh lebih stabil daripada ngejar label yg tiap render diobfuscate ulang.
+    // ============================================================
+    function findCtaAdMarkers() {
+        const found = [];
+        const candidates = document.querySelectorAll('[data-ad-rendering-role*="cta" i]');
+        for (const el of candidates) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+            try { const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden') continue; if (parseFloat(style.opacity) < 0.1) continue; } catch (e) { continue; }
+            if (isInsideComplementary(el)) continue;
+            found.push(el);
+        }
+        return found;
+    }
+
+    // v73.6.0: 4 jalur berurutan + dedup Set.
+    //   1) CTA ad-rendering-role → anchor UTAMA (cara paling stabil)
+    //   2) aria-labelledby       → label bersih di span hidden (v73.5.0)
+    //   3) exact innerText       → cara lama (fallback)
+    //   4) decode geometrik      → cara lama (fallback, udah difix U+034F)
+    // Semua jalur lama DIPERTAHANKAN = zero regression. findAllMarkers()
+    // dedup by container, jadi 1 post ketangkep 2 jalur tetap kehitung 1.
+    function findBersponsorMarkers() {
+        const found = []; const seen = new Set();
+        let nCta = 0, nAria = 0, nExact = 0, nDecoded = 0;
+        const ctas = findCtaAdMarkers();
+        for (const el of ctas) { if (seen.has(el)) continue; found.push(el); seen.add(el); nCta++; }
+        const aria = findAriaLabelledbySponsorMarkers();
+        for (const el of aria) { if (seen.has(el)) continue; found.push(el); seen.add(el); nAria++; }
+        const candidates = document.querySelectorAll('span, a');
+        for (const el of candidates) { if (seen.has(el)) continue; if (el.children.length > 50) continue; const text = (el.innerText || '').trim().toLowerCase().replace(/\s/g, ''); if (text !== 'bersponsor' && text !== 'sponsored' && text !== 'disponsori') continue; const rect = el.getBoundingClientRect(); if (rect.width === 0 || rect.height === 0) continue; try { const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden') continue; if (parseFloat(style.opacity) < 0.1) continue; } catch (e) { continue; } if (isInsideComplementary(el)) continue; found.push(el); seen.add(el); nExact++; }
+        const decoded = findDecodedBersponsorMarkers();
+        for (const el of decoded) { if (seen.has(el)) continue; found.push(el); seen.add(el); nDecoded++; }
+        if (found.length > 0) addLog('Marker: ' + found.length + ' (cta=' + nCta + ' aria=' + nAria + ' exact=' + nExact + ' decoded=' + nDecoded + ')', 'info');
+        return found;
+    }
+    function findPostContainerFromMarker(marker) { if (!marker) return null; if (isInsideComplementary(marker)) return null; let el = marker; const levels = []; for (let i = 0; i < 40 && el && el !== document.body; i++) { levels.push(el); el = el.parentElement; } function isPostSized(el) { const r = el.getBoundingClientRect(); return r.width >= 400 && r.width <= 900 && r.height >= 200 && r.height <= 2500; } for (const lvl of levels) { if (lvl.getAttribute && lvl.getAttribute('role') === 'article' && isPostSized(lvl)) return lvl; } for (const lvl of levels) { const pl = lvl.getAttribute && lvl.getAttribute('data-pagelet'); if (pl && pl.includes('FeedUnit') && isPostSized(lvl)) return lvl; } /* v73.5.0: tier baru — FB udah copot role="article" & data-pagelet FeedUnit dari post feed, jadi 2 tier di atas sering mental. data-ad-rendering-role="comment_button" masih konsisten ada di tiap post. */ for (const lvl of levels) { if (!lvl.querySelector || !isPostSized(lvl)) continue; if (lvl.querySelector('[data-ad-rendering-role="comment_button"]')) return lvl; } for (const lvl of levels) { if (!lvl.querySelector || !isPostSized(lvl)) continue; const buttons = lvl.querySelectorAll('div[role="button"][aria-label]'); let hasInteractive = false; for (const btn of buttons) { const al = (btn.getAttribute('aria-label') || '').toLowerCase(); if (al.includes('bagikan') || al.includes('berbagi') || al.includes('share') || al === 'komentar' || al === 'comment' || al.startsWith('beri komentar') || al === 'suka' || al === 'beri reaksi' || al === 'like') { hasInteractive = true; break; } } if (hasInteractive) return lvl; } for (const lvl of levels) { if (lvl.querySelector && isPostSized(lvl) && lvl.querySelector('[data-ad-rendering-role*="cta" i]')) return lvl; } return null; }
     function decodeObfuscatedText(containerEl) { if (!containerEl) return ''; const containerRect = containerEl.getBoundingClientRect(); if (containerRect.width === 0 || containerRect.height === 0) return ''; const allSpans = containerEl.querySelectorAll('span'); const charSpans = []; for (const sp of allSpans) { if (sp.children.length > 0) continue; const text = sp.textContent || ''; if (text.length === 0 || text.length > 3) continue; const r = sp.getBoundingClientRect(); if (r.width === 0 || r.height === 0) continue; const T = 5; if (r.left < containerRect.left - T || r.right > containerRect.right + T || r.top < containerRect.top - T || r.bottom > containerRect.bottom + T) continue; try { const cs = window.getComputedStyle(sp); if (cs.opacity === '0' || cs.visibility === 'hidden' || cs.display === 'none') continue; const fs = parseFloat(cs.fontSize); if (!isNaN(fs) && fs < 1) continue; } catch (e) {} charSpans.push({ text, x: r.left, y: r.top, width: r.width }); } if (charSpans.length === 0) return ''; charSpans.sort((a, b) => { const dy = a.y - b.y; return Math.abs(dy) > 5 ? dy : a.x - b.x; }); return charSpans.map(c => c.text).join(''); }
     function getCleanCTAText(ctaEl) { if (!ctaEl) return ''; try { const decoded = decodeObfuscatedText(ctaEl).trim(); if (decoded && decoded.length >= 2 && decoded.length <= 60) { const letterCount = (decoded.match(/[a-zA-Z]/g) || []).length; if (letterCount >= 2) return decoded; } } catch (e) {} const labelled = ctaEl.querySelectorAll('[aria-labelledby]'); for (const el of labelled) { const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/); for (const id of ids) { if (!id || !id.startsWith('_')) continue; const ref = document.getElementById(id); if (!ref) continue; const text = (ref.textContent || '').trim(); if (text) return text; } } const links = ctaEl.querySelectorAll('a[aria-label], [role="link"][aria-label]'); for (const a of links) { const al = (a.getAttribute('aria-label') || '').trim(); if (al) return al; } if (ctaEl.hasAttribute && ctaEl.hasAttribute('aria-label')) { const al = (ctaEl.getAttribute('aria-label') || '').trim(); if (al) return al; } let cur = ctaEl.parentElement; let depth = 0; while (cur && depth < 5) { if (cur.hasAttribute && cur.hasAttribute('aria-label')) { const al = (cur.getAttribute('aria-label') || '').trim(); if (al) return al; } cur = cur.parentElement; depth++; } return (ctaEl.innerText || ctaEl.textContent || '').trim(); }
     function getExcludeKeywords() { return RUNTIME_CONFIG.exclude_advertisers.map(k => k.toLowerCase().trim()).filter(k => k.length > 0); }
@@ -1126,7 +1206,7 @@
         + '#fb-scraper-panel .fbs-row .fbs-btn { margin-bottom: 0; }'
         + '#fb-scraper-panel .fbs-toast { position: fixed; bottom: 20px; right: 20px; background: #42b72a; color: white; padding: 10px 16px; border-radius: 6px; font-weight: 600; z-index: 2147483647; }'
         + '</style>'
-        + '<div class="fbs-header" id="fbs-header"><span class="fbs-title">FB Scraper v73.4.0</span><button class="fbs-mini-btn" id="fbs-minimize">_</button></div>'
+        + '<div class="fbs-header" id="fbs-header"><span class="fbs-title">FB Scraper v73.6.0</span><button class="fbs-mini-btn" id="fbs-minimize">_</button></div>'
         + '<div class="fbs-body">'
         + '<div class="fbs-saved-box"><div class="fbs-saved-num" id="fbs-stat-count">0</div><div class="fbs-saved-label">Link Inbox Tersimpan</div></div>'
         + '<div class="fbs-stats-row"><div class="fbs-stat-cell"><div class="num" id="fbs-stat-detected" style="color:#42b72a;">0</div><div class="lbl">Detected</div></div><div class="fbs-stat-cell"><div class="num" id="fbs-stat-dup" style="color:#ff77ff;">0</div><div class="lbl">Dedup</div></div></div>'
