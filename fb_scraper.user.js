@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FB Sponsored Ads Link Scraper
 // @namespace    https://riko.local/fbscraper
-// @version      73.6.0
-// @description  v73.6.0 - ANCHOR BARU: deteksi iklan lewat data-ad-rendering-role=cta (CTA cuma nempel di iklan, gak di post biasa) — label Bersponsor gak lagi jadi syarat. FB nyelipin U+034F tiap huruf + class CSS acak, bikin decode label mustahil dikejar. Jalur label lama (aria-labelledby / exact / decoded) tetap jalan sebagai tambahan. v73.5.0 = marker aria-labelledby + container via comment_button. v73.4.0 = Comment Rank scan 5x PageDown, gate SMM rank 1/2. v73.3.0 = Top 2 dual filter.
+// @version      73.7.0
+// @description  v73.7.0 - FILTER CTA: tolak CTA yg mengandung 'kirim'/'send' (Kirim Pesan / Send Message = CTA fanspage & iklan click-to-message, bukan target). Plus pembersih U+034F di teks CTA (FB nyelipin combining grapheme joiner tiap huruf, 'Daftar sekarang' kebaca 30 char). v73.6.0 = anchor CTA data-ad-rendering-role. v73.5.0 = marker aria-labelledby + container via comment_button. v73.4.0 = Comment Rank scan 5x PageDown, gate SMM rank 1/2.
 // @author       Riko
 // @match        *://*.facebook.com/*
 // @match        *://*.messenger.com/*
@@ -94,7 +94,7 @@
 
     function navigateToFeedRecover(reason) {
         try {
-            console.error('[FB Scraper v73.6.0] navigateToFeedRecover called outside mainScript scope: ' + reason);
+            console.error('[FB Scraper v73.7.0] navigateToFeedRecover called outside mainScript scope: ' + reason);
         } catch (e) {}
     }
 
@@ -102,7 +102,7 @@
     function scheduleGlobalErrorReload(reason) {
         try {
             globalErrorCount++;
-            console.warn('[FB Scraper v73.6.0] WOULD REFRESH (global-error, disabled): ' + reason + ' (total: ' + globalErrorCount + ')');
+            console.warn('[FB Scraper v73.7.0] WOULD REFRESH (global-error, disabled): ' + reason + ' (total: ' + globalErrorCount + ')');
         } catch (e) {}
     }
 
@@ -152,13 +152,13 @@
                 reason === 'fb-error-after-scroll'
             );
             if (allowRefresh) {
-                console.warn('[FB Scraper v73.6.0] REFRESH AKTIF: ' + reason);
+                console.warn('[FB Scraper v73.7.0] REFRESH AKTIF: ' + reason);
                 addLog('REFRESH: ' + reason, 'error');
                 GM_setValue(NEED_RELOAD_AFTER_NAV_KEY, '1');
                 GM_setValue(AUTO_RESUME_KEY, '1');
                 window.location.href = FEED_URL_V16;
             } else {
-                console.error('[FB Scraper v73.6.0] WOULD REFRESH (disabled): ' + reason);
+                console.error('[FB Scraper v73.7.0] WOULD REFRESH (disabled): ' + reason);
                 addLog('WOULD REFRESH: ' + reason + ' (disabled, lanjut scroll)', 'error');
             }
         } catch (e) {}
@@ -849,6 +849,33 @@
     //   3) decode geometrik → cara lama (DIPERTAHANKAN, fallback)
     // Kalau FB balik ke cara lama, jalur 2/3 tetap nangkep = zero regression.
         // ============================================================
+    // ============================================================
+    // v73.7.0: FILTER TEKS CTA
+    // "Kirim Pesan" / "Send Message" = CTA fanspage + iklan click-to-message.
+    // Bukan target scraping, jadi dibuang total (gak jadi marker, dan hasCTA
+    // ikut nolak biar gate extractOnePost gak kelolosan lewat jalur label).
+    // Tambah kata di array ini kalau nanti ketemu varian lain.
+    // ============================================================
+    const CTA_BLOCK_KEYWORDS = ['kirim', 'send'];
+
+    // FB nyelipin U+034F (combining grapheme joiner) di belakang TIAP huruf.
+    // Akibatnya "Daftar sekarang" (15 huruf) kebaca jadi 30 char, dan
+    // perbandingan teks apa pun bakal meleset. Ini dibuang dulu sebelum dicek.
+    function bersihkanTeksCTA(t) {
+        if (!t) return '';
+        let str = String(t);
+        try { str = str.normalize('NFKD'); } catch (e) {}
+        str = str.replace(/[\u0300-\u036f\u200b-\u200f\u2060-\u206f\ufe00-\ufe0f\ufeff\u00ad]/g, '');
+        return str.replace(/\s+/g, ' ').trim();
+    }
+
+    function isCtaDiblokir(teks) {
+        const low = bersihkanTeksCTA(teks).toLowerCase();
+        if (!low) return false;
+        for (const kw of CTA_BLOCK_KEYWORDS) { if (low.includes(kw)) return true; }
+        return false;
+    }
+
     // v73.6.0: ANCHOR UTAMA BARU — data-ad-rendering-role="cta".
     // Alasan: hasCTA() udah jadi GATE WAJIB di extractOnePost (no CTA = skip),
     // jadi nyari label "Bersponsor" duluan itu kerja dua kali buat hasil sama.
@@ -863,6 +890,8 @@
             if (rect.width === 0 || rect.height === 0) continue;
             try { const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden') continue; if (parseFloat(style.opacity) < 0.1) continue; } catch (e) { continue; }
             if (isInsideComplementary(el)) continue;
+            // v73.7.0: CTA "Kirim Pesan"/"Send Message" gak dianggap iklan
+            if (isCtaDiblokir(getCleanCTAText(el))) continue;
             found.push(el);
         }
         return found;
@@ -891,11 +920,13 @@
     }
     function findPostContainerFromMarker(marker) { if (!marker) return null; if (isInsideComplementary(marker)) return null; let el = marker; const levels = []; for (let i = 0; i < 40 && el && el !== document.body; i++) { levels.push(el); el = el.parentElement; } function isPostSized(el) { const r = el.getBoundingClientRect(); return r.width >= 400 && r.width <= 900 && r.height >= 200 && r.height <= 2500; } for (const lvl of levels) { if (lvl.getAttribute && lvl.getAttribute('role') === 'article' && isPostSized(lvl)) return lvl; } for (const lvl of levels) { const pl = lvl.getAttribute && lvl.getAttribute('data-pagelet'); if (pl && pl.includes('FeedUnit') && isPostSized(lvl)) return lvl; } /* v73.5.0: tier baru — FB udah copot role="article" & data-pagelet FeedUnit dari post feed, jadi 2 tier di atas sering mental. data-ad-rendering-role="comment_button" masih konsisten ada di tiap post. */ for (const lvl of levels) { if (!lvl.querySelector || !isPostSized(lvl)) continue; if (lvl.querySelector('[data-ad-rendering-role="comment_button"]')) return lvl; } for (const lvl of levels) { if (!lvl.querySelector || !isPostSized(lvl)) continue; const buttons = lvl.querySelectorAll('div[role="button"][aria-label]'); let hasInteractive = false; for (const btn of buttons) { const al = (btn.getAttribute('aria-label') || '').toLowerCase(); if (al.includes('bagikan') || al.includes('berbagi') || al.includes('share') || al === 'komentar' || al === 'comment' || al.startsWith('beri komentar') || al === 'suka' || al === 'beri reaksi' || al === 'like') { hasInteractive = true; break; } } if (hasInteractive) return lvl; } for (const lvl of levels) { if (lvl.querySelector && isPostSized(lvl) && lvl.querySelector('[data-ad-rendering-role*="cta" i]')) return lvl; } return null; }
     function decodeObfuscatedText(containerEl) { if (!containerEl) return ''; const containerRect = containerEl.getBoundingClientRect(); if (containerRect.width === 0 || containerRect.height === 0) return ''; const allSpans = containerEl.querySelectorAll('span'); const charSpans = []; for (const sp of allSpans) { if (sp.children.length > 0) continue; const text = sp.textContent || ''; if (text.length === 0 || text.length > 3) continue; const r = sp.getBoundingClientRect(); if (r.width === 0 || r.height === 0) continue; const T = 5; if (r.left < containerRect.left - T || r.right > containerRect.right + T || r.top < containerRect.top - T || r.bottom > containerRect.bottom + T) continue; try { const cs = window.getComputedStyle(sp); if (cs.opacity === '0' || cs.visibility === 'hidden' || cs.display === 'none') continue; const fs = parseFloat(cs.fontSize); if (!isNaN(fs) && fs < 1) continue; } catch (e) {} charSpans.push({ text, x: r.left, y: r.top, width: r.width }); } if (charSpans.length === 0) return ''; charSpans.sort((a, b) => { const dy = a.y - b.y; return Math.abs(dy) > 5 ? dy : a.x - b.x; }); return charSpans.map(c => c.text).join(''); }
-    function getCleanCTAText(ctaEl) { if (!ctaEl) return ''; try { const decoded = decodeObfuscatedText(ctaEl).trim(); if (decoded && decoded.length >= 2 && decoded.length <= 60) { const letterCount = (decoded.match(/[a-zA-Z]/g) || []).length; if (letterCount >= 2) return decoded; } } catch (e) {} const labelled = ctaEl.querySelectorAll('[aria-labelledby]'); for (const el of labelled) { const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/); for (const id of ids) { if (!id || !id.startsWith('_')) continue; const ref = document.getElementById(id); if (!ref) continue; const text = (ref.textContent || '').trim(); if (text) return text; } } const links = ctaEl.querySelectorAll('a[aria-label], [role="link"][aria-label]'); for (const a of links) { const al = (a.getAttribute('aria-label') || '').trim(); if (al) return al; } if (ctaEl.hasAttribute && ctaEl.hasAttribute('aria-label')) { const al = (ctaEl.getAttribute('aria-label') || '').trim(); if (al) return al; } let cur = ctaEl.parentElement; let depth = 0; while (cur && depth < 5) { if (cur.hasAttribute && cur.hasAttribute('aria-label')) { const al = (cur.getAttribute('aria-label') || '').trim(); if (al) return al; } cur = cur.parentElement; depth++; } return (ctaEl.innerText || ctaEl.textContent || '').trim(); }
+    function getCleanCTAText(ctaEl) { return bersihkanTeksCTA(getCleanCTATextRaw(ctaEl)); }
+
+    function getCleanCTATextRaw(ctaEl) { if (!ctaEl) return ''; try { const decoded = decodeObfuscatedText(ctaEl).trim(); if (decoded && decoded.length >= 2 && decoded.length <= 60) { const letterCount = (decoded.match(/[a-zA-Z]/g) || []).length; if (letterCount >= 2) return decoded; } } catch (e) {} const labelled = ctaEl.querySelectorAll('[aria-labelledby]'); for (const el of labelled) { const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/); for (const id of ids) { if (!id || !id.startsWith('_')) continue; const ref = document.getElementById(id); if (!ref) continue; const text = (ref.textContent || '').trim(); if (text) return text; } } const links = ctaEl.querySelectorAll('a[aria-label], [role="link"][aria-label]'); for (const a of links) { const al = (a.getAttribute('aria-label') || '').trim(); if (al) return al; } if (ctaEl.hasAttribute && ctaEl.hasAttribute('aria-label')) { const al = (ctaEl.getAttribute('aria-label') || '').trim(); if (al) return al; } let cur = ctaEl.parentElement; let depth = 0; while (cur && depth < 5) { if (cur.hasAttribute && cur.hasAttribute('aria-label')) { const al = (cur.getAttribute('aria-label') || '').trim(); if (al) return al; } cur = cur.parentElement; depth++; } return (ctaEl.innerText || ctaEl.textContent || '').trim(); }
     function getExcludeKeywords() { return RUNTIME_CONFIG.exclude_advertisers.map(k => k.toLowerCase().trim()).filter(k => k.length > 0); }
     function isAdvertiserExcluded(advertiser) { if (!advertiser) return false; const keywords = getExcludeKeywords(); if (keywords.length === 0) return false; const advLower = advertiser.toLowerCase(); for (const kw of keywords) if (advLower.includes(kw)) return { excluded: true, keyword: kw }; return { excluded: false }; }
     function extractAdvertiserFromPost(post) { if (!post) return 'Unknown'; try { const h = post.querySelector('h3 a strong, h4 a strong, h3 strong, h4 strong, h3 a span, h4 a span, h3 a, h4 a'); if (h) { const t = (h.innerText || '').trim(); if (t && t.length > 1 && t.length < 80) return t; } } catch (e) {} return 'Unknown'; }
-    function hasCTA(post) { if (!post) return { found: false }; const ctaElements = post.querySelectorAll('[data-ad-rendering-role]'); for (const el of ctaElements) { if (!post.contains(el)) continue; const role = (el.getAttribute('data-ad-rendering-role') || '').toLowerCase(); if (role.includes('cta')) { try { const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden') continue; } catch (e) {} const rect = el.getBoundingClientRect(); if (rect.width === 0 || rect.height === 0) continue; const text = getCleanCTAText(el); return { found: true, text: text || '(CTA)', role: role, element: el }; } } return { found: false }; }
+    function hasCTA(post) { if (!post) return { found: false }; const ctaElements = post.querySelectorAll('[data-ad-rendering-role]'); for (const el of ctaElements) { if (!post.contains(el)) continue; const role = (el.getAttribute('data-ad-rendering-role') || '').toLowerCase(); if (role.includes('cta')) { try { const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden') continue; } catch (e) {} const rect = el.getBoundingClientRect(); if (rect.width === 0 || rect.height === 0) continue; const text = getCleanCTAText(el); /* v73.7.0: CTA kirim/send = fanspage / click-to-message, bukan target */ if (isCtaDiblokir(text)) continue; return { found: true, text: text || '(CTA)', role: role, element: el }; } } return { found: false }; }
     function findCommentButtonInPost(post) { if (!post) return null; const adComment = post.querySelector('[data-ad-rendering-role="comment_button"]'); if (adComment) { const directRect = adComment.getBoundingClientRect(); if (directRect.width > 0 && directRect.height > 0) { if (adComment.getAttribute('role') === 'button' || adComment.onclick || adComment.tagName === 'BUTTON' || adComment.tagName === 'A') return adComment; let parent = adComment.parentElement; let depth = 0; while (parent && parent !== post && depth < 8) { if (parent.getAttribute && parent.getAttribute('role') === 'button') { const pRect = parent.getBoundingClientRect(); if (pRect.width > 0 && pRect.height > 0) return parent; } parent = parent.parentElement; depth++; } return adComment; } } const buttons = post.querySelectorAll('div[role="button"][aria-label]'); for (const btn of buttons) { if (!post.contains(btn)) continue; const al = (btn.getAttribute('aria-label') || '').toLowerCase(); if (!al) continue; if (al.includes('react') || al.includes('suka') || al.includes('reaksi')) continue; if (al.includes('bagikan') || al.includes('berbagi') || al.includes('share')) continue; if (al.includes('menu') || al.includes('bersponsor')) continue; const isComment = al === 'komentar' || al === 'comment' || al.startsWith('beri komentar') || al.startsWith('write a comment') || al === 'leave a comment' || al.startsWith('comment on ') || al.startsWith('komentari ') || al === 'komentari'; if (!isComment) continue; const rect = btn.getBoundingClientRect(); if (rect.width === 0 || rect.height === 0) continue; return btn; } const fallbackButtons = post.querySelectorAll('div[role="button"]'); for (const btn of fallbackButtons) { if (!post.contains(btn)) continue; if (btn.querySelector('[data-ad-rendering-role="comment_button"]')) { const rect = btn.getBoundingClientRect(); if (rect.width > 0 && rect.height > 0) return btn; } } for (const btn of fallbackButtons) { if (!post.contains(btn)) continue; const spans = btn.querySelectorAll('span'); for (const sp of spans) { const txt = (sp.textContent || '').trim().toLowerCase(); if (txt === 'komentari' || txt === 'komentar' || txt === 'comment') { const al = (btn.getAttribute('aria-label') || '').toLowerCase(); if (al.includes('react') || al.includes('suka') || al.includes('reaksi') || al.includes('bagikan') || al.includes('share')) continue; const rect = btn.getBoundingClientRect(); if (rect.width === 0 || rect.height === 0) continue; return btn; } } } return null; }
 
     function getVisibleDialogs() { const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]')); return dialogs.filter(d => { const rect = d.getBoundingClientRect(); return rect.width > 0 && rect.height > 0; }); }
@@ -1206,7 +1237,7 @@
         + '#fb-scraper-panel .fbs-row .fbs-btn { margin-bottom: 0; }'
         + '#fb-scraper-panel .fbs-toast { position: fixed; bottom: 20px; right: 20px; background: #42b72a; color: white; padding: 10px 16px; border-radius: 6px; font-weight: 600; z-index: 2147483647; }'
         + '</style>'
-        + '<div class="fbs-header" id="fbs-header"><span class="fbs-title">FB Scraper v73.6.0</span><button class="fbs-mini-btn" id="fbs-minimize">_</button></div>'
+        + '<div class="fbs-header" id="fbs-header"><span class="fbs-title">FB Scraper v73.7.0</span><button class="fbs-mini-btn" id="fbs-minimize">_</button></div>'
         + '<div class="fbs-body">'
         + '<div class="fbs-saved-box"><div class="fbs-saved-num" id="fbs-stat-count">0</div><div class="fbs-saved-label">Link Inbox Tersimpan</div></div>'
         + '<div class="fbs-stats-row"><div class="fbs-stat-cell"><div class="num" id="fbs-stat-detected" style="color:#42b72a;">0</div><div class="lbl">Detected</div></div><div class="fbs-stat-cell"><div class="num" id="fbs-stat-dup" style="color:#ff77ff;">0</div><div class="lbl">Dedup</div></div></div>'
