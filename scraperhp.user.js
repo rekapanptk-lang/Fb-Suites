@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FB Mobile Ads Scraper (BASIC)
 // @namespace    https://riko.local/fbmobile
-// @version      1.10.0
+// @version      1.11.0
 // @description  BASIC: scroll m.facebook, deteksi Bersponsor, klik comments, tangkap URL, rapikan jadi {id}/posts/{fbid}, kirim SEMUA ke sheet (dedup diserahkan ke GAS). Keluar komentar via tombol Kembali FB. Refresh cuma kalau 30x scroll berturut-turut TANPA tekan komentar.
 // @author       Riko
 // @match        *://m.facebook.com/*
@@ -26,7 +26,7 @@
     const ENDPOINT_URL = 'https://script.google.com/macros/s/AKfycbxe3mCNLCDfmEEwHpi4EKEAVTrAyoAewPIakY4F3ZQ0qNVhr3PBWWOfx5vNWLQ76YQGKQ/exec';
 
     const TM_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
-        ? GM_info.script.version : '1.10.0';
+        ? GM_info.script.version : '1.11.0';
 
     const AKUN_FB_KEY     = 'fbm_akun_fb_v1';
     const AUTO_RESUME_KEY = 'fbm_auto_resume_v1';
@@ -729,11 +729,22 @@
 
             // pil kecil
             if (g('fbm-pill-num')) g('fbm-pill-num').textContent = statSent;
-            const dot = g('fbm-pill-dot');
-            if (dot) {
-                if (running && paused) dot.style.background = '#EF9F27';
-                else if (running) dot.style.background = '#5DCAA5';
-                else dot.style.background = '#888780';
+
+            // v1.11.0: ikon = AKSI kalau ditekan, bukan keadaan sekarang.
+            //   lagi jalan  -> tampil PAUSE (dua garis)
+            //   idle/pause  -> tampil PLAY (segitiga)
+            const ikon = g('fbm-icon-path');
+            if (ikon) {
+                const lagiJalan = running && !paused;
+                ikon.setAttribute('d', lagiJalan
+                    ? 'M1.5 1 H4 V11 H1.5 Z M7 1 H9.5 V11 H7 Z'   // pause
+                    : 'M1 1 L10 6 L1 11 Z');                       // play
+            }
+            const pil = g('fbm-pill');
+            if (pil) {
+                if (running && paused) pil.style.background = '#854F0B';   // pause
+                else if (running) pil.style.background = '#0F6E56';        // jalan
+                else pil.style.background = '#3A3A38';                     // idle
             }
 
             const st = g('fbm-status');
@@ -781,13 +792,28 @@
         w.innerHTML = '<style>'
             + '#fbm-wrap{position:fixed!important;left:8px!important;right:8px!important;bottom:8px!important;z-index:2147483646!important;font-family:-apple-system,BlinkMacSystemFont,sans-serif!important;pointer-events:none;}'
             + '#fbm-wrap *{box-sizing:border-box;}'
-            + '#fbm-pill{pointer-events:auto;display:flex;align-items:center;gap:6px;background:#0F6E56;color:#fff;border-radius:20px;padding:6px 11px;cursor:pointer;width:max-content;}'
+            + '#fbm-pill{pointer-events:auto;display:flex;align-items:center;background:#0F6E56;color:#fff;border-radius:20px;width:max-content;overflow:hidden;}'
+            + '#fbm-pill .seg{display:flex;align-items:center;justify-content:center;cursor:pointer;}'
+            + '#fbm-pill .seg:active{background:rgba(0,0,0,.22);}'
+            + '#fbm-pill-num{padding:6px 10px 6px 12px;font-size:13px;font-weight:500;min-width:26px;}'
+            + '#fbm-pill-play{padding:6px 9px;border-left:1px solid rgba(255,255,255,.22);}'
+            + '#fbm-pill-open{padding:6px 10px 6px 9px;border-left:1px solid rgba(255,255,255,.22);}'
             + '#fbm-body{pointer-events:auto;display:none;background:rgba(23,26,28,.88);border-radius:10px;padding:9px 11px;color:#fff;}'
             + '#fbm-wrap input{width:100%;background:rgba(255,255,255,.08);color:#fff;border:1px solid #444441;padding:5px 7px;border-radius:5px;font-size:11px;margin-bottom:5px;font-family:inherit;}'
             + '</style>'
 
-            + '<div id="fbm-pill"><span id="fbm-pill-dot" style="width:7px;height:7px;border-radius:50%;background:#888780;"></span>'
-            + '<span id="fbm-pill-num" style="font-size:13px;font-weight:500;">0</span></div>'
+            // v1.11.0: pil isinya 3 bagian —
+            //   [jumlah kirim] [play/pause] [panah buka panel]
+            // Dulu cuma titik + angka, dan buat pause harus buka panel dulu.
+            + '<div id="fbm-pill">'
+            + '<span class="seg" id="fbm-pill-num">0</span>'
+            + '<span class="seg" id="fbm-pill-play" title="start / pause">'
+            + '<svg id="fbm-pill-icon" width="11" height="12" viewBox="0 0 11 12" fill="#fff" aria-hidden="true">'
+            + '<path id="fbm-icon-path" d="M1 1 L10 6 L1 11 Z"/></svg></span>'
+            + '<span class="seg" id="fbm-pill-open" title="buka panel">'
+            + '<svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+            + '<path d="M2 6.8 L5.5 3.3 L9 6.8"/></svg></span>'
+            + '</div>'
 
             + '<div id="fbm-body">'
             + '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:9px;">'
@@ -820,7 +846,31 @@
 
         document.body.appendChild(w);
 
-        document.getElementById('fbm-pill').addEventListener('click', () => { setPanelOpen(true); applyPanelState(); updateUI(); });
+        // panah -> buka panel
+        document.getElementById('fbm-pill-open').addEventListener('click', (e) => {
+            e.stopPropagation();
+            setPanelOpen(true); applyPanelState(); updateUI();
+        });
+        // angka -> buka panel juga (sasaran gede, gampang dipencet)
+        document.getElementById('fbm-pill-num').addEventListener('click', (e) => {
+            e.stopPropagation();
+            setPanelOpen(true); applyPanelState(); updateUI();
+        });
+        // play/pause langsung dari pil, gak perlu buka panel
+        document.getElementById('fbm-pill-play').addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (!running) {
+                if (!getAkunFb()) {
+                    setPanelOpen(true); applyPanelState(); updateUI();
+                    alert('Nama Akun FB belum diisi!');
+                    return;
+                }
+                mainLoop();
+            } else {
+                togglePause();
+            }
+            updateUI();
+        });
         document.getElementById('fbm-close').addEventListener('click', () => { setPanelOpen(false); applyPanelState(); });
 
         const inp = document.getElementById('fbm-akun-input');
