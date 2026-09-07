@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FB Mobile Ads Scraper (BASIC)
 // @namespace    https://riko.local/fbmobile
-// @version      1.9.0
+// @version      1.10.0
 // @description  BASIC: scroll m.facebook, deteksi Bersponsor, klik comments, tangkap URL, rapikan jadi {id}/posts/{fbid}, kirim SEMUA ke sheet (dedup diserahkan ke GAS). Keluar komentar via tombol Kembali FB. Refresh cuma kalau 30x scroll berturut-turut TANPA tekan komentar.
 // @author       Riko
 // @match        *://m.facebook.com/*
@@ -26,7 +26,7 @@
     const ENDPOINT_URL = 'https://script.google.com/macros/s/AKfycbxe3mCNLCDfmEEwHpi4EKEAVTrAyoAewPIakY4F3ZQ0qNVhr3PBWWOfx5vNWLQ76YQGKQ/exec';
 
     const TM_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
-        ? GM_info.script.version : '1.9.0';
+        ? GM_info.script.version : '1.10.0';
 
     const AKUN_FB_KEY     = 'fbm_akun_fb_v1';
     const AUTO_RESUME_KEY = 'fbm_auto_resume_v1';
@@ -236,23 +236,55 @@
 
     // F12: urutan tombol = [reaksi] [like] [COMMENTS] [share]
     // label comments = "247comments" / "󰍹 176comments" — angka bebas, diabaikan
+    function cocokComment(el) {
+        const n = normText(cleanLabel(el.getAttribute('aria-label')));
+        if (!n) return 0;
+        const bare = n.replace(/[0-9]/g, '');
+        if (bare === 'comments' || bare === 'comment' || bare === 'komentar' || bare === 'komentari') return 2;
+        if (BTN_BLOCK.test(n)) return 0;
+        if (n.indexOf('comment') >= 0 || n.indexOf('komentar') >= 0) return 1;
+        return 0;
+    }
+
     function pickCommentButton(scope) {
         if (!scope || !scope.querySelectorAll) return null;
         const btns = Array.from(scope.querySelectorAll('div[role="button"][aria-label]'));
-
-        // pass 1 (ketat): label = angka + "comments"
-        for (const b of btns) {
-            const n = normText(cleanLabel(b.getAttribute('aria-label')));
-            const bare = n.replace(/[0-9]/g, '');
-            if (bare === 'comments' || bare === 'comment' || bare === 'komentar' || bare === 'komentari') return b;
-        }
-        // pass 2 (longgar): mengandung comment/komentar & bukan tombol lain
-        for (const b of btns) {
-            const n = normText(cleanLabel(b.getAttribute('aria-label')));
-            if (!n || BTN_BLOCK.test(n)) continue;
-            if (n.indexOf('comment') >= 0 || n.indexOf('komentar') >= 0) return b;
-        }
+        for (const b of btns) if (cocokComment(b) === 2) return b;   // pass 1: ketat
+        for (const b of btns) if (cocokComment(b) === 1) return b;   // pass 2: longgar
         return null;
+    }
+
+    // v1.10.0: pilih tombol comments yang PALING DEKAT DI BAWAH marker
+    // "Bersponsor", bukan yang pertama ketemu di container.
+    //
+    // Kenapa: di halaman story.php container yang ketemu bisa sebesar
+    // 400x4308 dengan 31 tombol comments — "yang pertama" belum tentu
+    // punya iklan yang bener. Di feed biasa container cuma 400x697 dan
+    // isinya satu tombol, jadi hasilnya SAMA PERSIS kayak cara lama.
+    //
+    // Kalau gagal, jatuh balik ke pickCommentButton (cara lama).
+    function pickCommentButtonDekat(scope, marker) {
+        if (!scope || !marker) return pickCommentButton(scope);
+        let mTop;
+        try { mTop = marker.getBoundingClientRect().top; } catch (e) { return pickCommentButton(scope); }
+
+        const btns = Array.from(scope.querySelectorAll('div[role="button"][aria-label]'));
+        let terbaik = null, jarakTerbaik = Infinity, skorTerbaik = 0;
+
+        for (const b of btns) {
+            const skor = cocokComment(b);
+            if (!skor) continue;
+            let r;
+            try { r = b.getBoundingClientRect(); } catch (e) { continue; }
+            if (r.height === 0) continue;
+            const jarak = r.top - mTop;
+            if (jarak < 0) continue;                 // di ATAS marker -> punya post lain
+            if (jarak > 2500) continue;              // kejauhan -> bukan punya iklan ini
+            if (skor > skorTerbaik || (skor === skorTerbaik && jarak < jarakTerbaik)) {
+                terbaik = b; jarakTerbaik = jarak; skorTerbaik = skor;
+            }
+        }
+        return terbaik || pickCommentButton(scope);
     }
 
     // F12: container ketemu di 6 level ke atas dari marker
@@ -289,9 +321,14 @@
         } catch (e) { return String(href); }
     }
 
+    // v1.10.0: halaman post BOLEH jadi rumah.
+    // Dulu ada larangan "kalau alamatnya story.php, itu bukan rumah" —
+    // akibatnya kalau bot dijalanin DI halaman story.php, dia langsung
+    // nganggap dirinya nyasar lalu tekan Kembali, gak pernah nyampe scan.
+    // Sekarang yang nentuin cuma alamat persisnya, bukan bentuknya.
+    // Habis klik komentar alamat tetap berubah, jadi tetap kedeteksi keluar.
     function isOnFeed() {
         try {
-            if (isPostUrl(location.href)) return false;
             return sidikHalaman(location.href) === sidikHalaman(HOME_URL);
         } catch (e) { return false; }
     }
@@ -411,10 +448,13 @@
         }
     }
 
-    async function processPost(post) {
+    async function processPost(post, marker) {
         try { post.setAttribute(DONE_ATTR, '1'); } catch (e) {}
 
-        const btn = pickCommentButton(post);
+        // v1.10.0: tombol paling dekat di bawah "Bersponsor".
+        // Di feed hasilnya sama persis kayak cara lama (container cuma
+        // punya satu tombol). Bedanya kerasa di halaman story.php.
+        const btn = pickCommentButtonDekat(post, marker);
         if (!btn) { statFail++; addLog('Post: tombol comments tidak ketemu', 'warning'); updateUI(); return; }
 
         const label = cleanLabel(btn.getAttribute('aria-label'));
@@ -530,7 +570,8 @@
             if (seenEl.indexOf(post) >= 0) continue;
             seenEl.push(post);
             if (post.getAttribute(DONE_ATTR) === '1') continue;
-            out.push(post);
+            // v1.10.0: marker dibawa serta, dipakai buat cari tombol terdekat
+            out.push({ post: post, marker: mk });
         }
         return out;
     }
@@ -541,9 +582,9 @@
 
         running = true; shouldStop = false; paused = false;
 
-        // v1.9.0: halaman yang lagi kebuka jadi "rumah" bot.
-        // Kalau lagi telanjur di halaman post, jangan dijadiin rumah.
-        if (!isPostUrl(location.href)) setHome(location.href);
+        // v1.10.0: halaman apa pun yang lagi kebuka jadi rumah — termasuk
+        // story.php. Bot dijalanin di mana, di situ dia kerja.
+        setHome(location.href);
         addLog('Main: START (' + getAkunFb() + ' - v' + TM_VERSION + ')', 'success');
         addLog('Rumah: ' + HOME_URL.substring(0, 90), 'info');
         updateUI();
@@ -576,10 +617,11 @@
                 // Sekarang: klik 1 iklan -> scroll -> scan lagi. Bot pasti maju.
                 if (posts.length > 0) {
                     addLog('Scan: ' + posts.length + ' iklan di layar', 'detect');
-                    const p = posts[0];
+                    const p = posts[0].post;
+                    const mk = posts[0].marker;
                     if (document.body.contains(p) && p.getAttribute(DONE_ATTR) !== '1') {
                         setPhase('proses');
-                        await processPost(p);
+                        await processPost(p, mk);
                         if (!(await interruptibleSleep(rand(SET.BETWEEN_POSTS_MIN, SET.BETWEEN_POSTS_MAX)))) break;
 
                         // v1.5.0: geser SECUKUPNYA — cuma sampai post yang barusan
