@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FB Mobile Ads Scraper (BASIC)
 // @namespace    https://riko.local/fbmobile
-// @version      1.8.0
+// @version      1.9.0
 // @description  BASIC: scroll m.facebook, deteksi Bersponsor, klik comments, tangkap URL, rapikan jadi {id}/posts/{fbid}, kirim SEMUA ke sheet (dedup diserahkan ke GAS). Keluar komentar via tombol Kembali FB. Refresh cuma kalau 30x scroll berturut-turut TANPA tekan komentar.
 // @author       Riko
 // @match        *://m.facebook.com/*
@@ -26,18 +26,28 @@
     const ENDPOINT_URL = 'https://script.google.com/macros/s/AKfycbxe3mCNLCDfmEEwHpi4EKEAVTrAyoAewPIakY4F3ZQ0qNVhr3PBWWOfx5vNWLQ76YQGKQ/exec';
 
     const TM_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
-        ? GM_info.script.version : '1.8.0';
+        ? GM_info.script.version : '1.9.0';
 
     const AKUN_FB_KEY     = 'fbm_akun_fb_v1';
     const AUTO_RESUME_KEY = 'fbm_auto_resume_v1';
     const PANEL_OPEN_KEY  = 'fbm_panel_open_v1';
+    const HOME_KEY        = 'fbm_home_url_v1';
     const DONE_ATTR       = 'data-fbm-done';
 
     // dipakai GAS di action=submit — JANGAN diubah (GAS nol perubahan)
     const HARDCODED_KOMENTAR = '\u{1D64E}\u{1D64A}\u{1D648}\u{1D63D}\u{1D64A}\u{1D64F}\u{1D642}\u{1D63E}\u{1D640}\u{1D63F}';
 
-    // v1.8.0: feed mengikuti host yang sedang dipakai (m / www / web)
-    const FEED_URL = location.protocol + '//' + location.hostname + '/';
+    // v1.9.0: "rumah" TIDAK dipatok ke feed lagi.
+    // Dulu rumah = m.facebook.com/ doang, jadi di halaman pencarian
+    // (/search_results/?q=...) bot mikir dirinya nyasar lalu kabur balik
+    // ke feed. Sekarang rumah = halaman apa pun yang lagi kebuka waktu
+    // START ditekan. Feed, pencarian, grup, profil — bebas.
+    let HOME_URL = location.href;
+
+    function setHome(url) {
+        HOME_URL = url || location.href;
+        try { GM_setValue(HOME_KEY, HOME_URL); } catch (e) {}
+    }
 
     const SET = {
         SCROLL_MIN: 500, SCROLL_MAX: 900,
@@ -261,12 +271,28 @@
         return /story\.php|permalink\.php|\/posts\/|\/reel\/|\/videos\/|\/watch\/|photo\.php|\/photo\//.test(href);
     }
 
-    // v1.8.0: berlaku untuk m.facebook.com maupun www.facebook.com
+    // v1.9.0: "di rumah" = di halaman yang dicatat waktu START, BUKAN
+    // harus feed. Yang dibandingin cuma jalur + isi pencarian, ekor
+    // sampah FB (fbclid, __cft__, dsb) diabaikan biar gak salah nilai.
+    function sidikHalaman(href) {
+        try {
+            const u = new URL(href);
+            const buang = ['fbclid', 'mibextid', '_rdr', 'ref', 'refid', 'sfnsn', 'idorvanity'];
+            const p = new URLSearchParams();
+            for (const [k, v] of u.searchParams) {
+                if (buang.indexOf(k) >= 0) continue;
+                if (k.indexOf('__cft__') === 0 || k.indexOf('__tn__') === 0) continue;
+                p.append(k, v);
+            }
+            const q = p.toString();
+            return u.hostname + u.pathname.replace(/\/+$/, '') + (q ? '?' + q : '');
+        } catch (e) { return String(href); }
+    }
+
     function isOnFeed() {
         try {
             if (isPostUrl(location.href)) return false;
-            const u = new URL(location.href);
-            return u.pathname === '/' || u.pathname === '' || u.pathname === '/home.php';
+            return sidikHalaman(location.href) === sidikHalaman(HOME_URL);
         } catch (e) { return false; }
     }
 
@@ -364,7 +390,7 @@
         if (await waitBackToFeed(SET.BACK_WAIT_MS)) return true;
 
         // 3. semua gagal -> hard refresh ke m.facebook.com
-        refreshAndResume('gagal balik ke feed');
+        refreshAndResume('gagal balik ke halaman awal');
         return false;
     }
 
@@ -475,10 +501,12 @@
         try { GM_setValue(AUTO_RESUME_KEY, '1'); } catch (e) {}
         shouldStop = true;
         try {
-            // hard refresh: selalu mendarat di m.facebook.com
-            if (location.href === FEED_URL) location.reload();
-            else location.href = FEED_URL;
-        } catch (e) { location.href = FEED_URL; }
+            // v1.9.0: hard refresh mendarat di HALAMAN AWAL, bukan feed.
+            // Kalau bot dijalanin di /search_results/?q=dewi11, refresh
+            // balik ke situ juga — bukan diseret ke m.facebook.com.
+            if (location.href === HOME_URL) location.reload();
+            else location.href = HOME_URL;
+        } catch (e) { location.href = HOME_URL; }
     }
 
     async function scrollStep() {
@@ -512,7 +540,12 @@
         if (!getAkunFb()) { addLog('Main: Akun FB belum diisi', 'error'); return; }
 
         running = true; shouldStop = false; paused = false;
+
+        // v1.9.0: halaman yang lagi kebuka jadi "rumah" bot.
+        // Kalau lagi telanjur di halaman post, jangan dijadiin rumah.
+        if (!isPostUrl(location.href)) setHome(location.href);
         addLog('Main: START (' + getAkunFb() + ' - v' + TM_VERSION + ')', 'success');
+        addLog('Rumah: ' + HOME_URL.substring(0, 90), 'info');
         updateUI();
 
         let stuck = 0;
@@ -523,7 +556,7 @@
                 if (!(await waitPause())) break;
 
                 if (!isOnFeed()) {
-                    setPhase('balik feed');
+                    setPhase('balik rumah');
                     await backToFeed();
                     if (!(await interruptibleSleep(800))) break;
                     continue;
@@ -793,6 +826,10 @@
             const resume = GM_getValue(AUTO_RESUME_KEY, '');
             if (resume === '1') {
                 GM_setValue(AUTO_RESUME_KEY, '');
+                // v1.9.0: rumah dipulihkan, jadi habis refresh bot lanjut di
+                // halaman yang sama (mis. hasil pencarian), bukan pindah feed.
+                const rumah = GM_getValue(HOME_KEY, '');
+                if (rumah) setHome(rumah);
                 addLog('Auto-resume setelah muat ulang...', 'info');
                 setTimeout(() => { if (!running && getAkunFb()) mainLoop(); }, 6000);
             }
