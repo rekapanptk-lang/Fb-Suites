@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FB Mobile Ads Scraper (BASIC)
 // @namespace    https://riko.local/fbmobile
-// @version      1.11.0
-// @description  BASIC: scroll m.facebook, deteksi Bersponsor, klik comments, tangkap URL, rapikan jadi {id}/posts/{fbid}, kirim SEMUA ke sheet (dedup diserahkan ke GAS). Keluar komentar via tombol Kembali FB. Refresh cuma kalau 30x scroll berturut-turut TANPA tekan komentar.
+// @version      2.5.0
+// @description  v2: dua mode SEARCH & HOME. Di SEARCH: ambil link + klik CTA iklan (mancing). Di HOME: ambil link saja. Keyword dari TM_Config. Tab iklan diurus browser_scraper.js.
 // @author       Riko
 // @match        *://m.facebook.com/*
 // @match        *://www.facebook.com/*
@@ -13,6 +13,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -26,13 +27,25 @@
     const ENDPOINT_URL = 'https://script.google.com/macros/s/AKfycbxe3mCNLCDfmEEwHpi4EKEAVTrAyoAewPIakY4F3ZQ0qNVhr3PBWWOfx5vNWLQ76YQGKQ/exec';
 
     const TM_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
-        ? GM_info.script.version : '1.11.0';
+        ? GM_info.script.version : '2.5.0';
 
     const AKUN_FB_KEY     = 'fbm_akun_fb_v1';
     const AUTO_RESUME_KEY = 'fbm_auto_resume_v1';
     const PANEL_OPEN_KEY  = 'fbm_panel_open_v1';
     const HOME_KEY        = 'fbm_home_url_v1';
+    // v2.0.0 — status mode, disimpan biar selamat lewat pindah halaman
+    const MODE_KEY        = 'fbm_mode_v2';        // 'search' | 'home'
+    const KW_LIST_KEY     = 'fbm_kw_list_v2';     // daftar keyword dari sheet
+    const KW_IDX_KEY      = 'fbm_kw_idx_v2';      // keyword ke berapa
+    const MODE_LINK_KEY   = 'fbm_mode_link_v2';   // link kekumpul di mode ini
+    const KW_QUEUE_KEY    = 'fbm_kw_queue_v2';    // antrian keyword hasil kocokan
     const DONE_ATTR       = 'data-fbm-done';
+    // v2.3.2: penanda buat browser_scraper.js. Dia di LUAR halaman, gak bisa
+    // baca GM_getValue, tapi bisa baca atribut di <html>. Selama tanda ini
+    // kosong, pengurus tab di CMD DIAM TOTAL — gak catat tab, gak rebut
+    // fokus, gak tutup apa pun. Jadi waktu kamu masih setting Tampermonkey
+    // atau login Surfshark, gak ada yang ganggu.
+    const RUN_ATTR        = 'data-fbm-running';
 
     // dipakai GAS di action=submit — JANGAN diubah (GAS nol perubahan)
     const HARDCODED_KOMENTAR = '\u{1D64E}\u{1D64A}\u{1D648}\u{1D63D}\u{1D64A}\u{1D64F}\u{1D642}\u{1D63E}\u{1D640}\u{1D63F}';
@@ -57,7 +70,6 @@
         URL_WAIT_MS: 10000, URL_POLL_MS: 150, URL_SETTLE_MS: 400,
         BACK_WAIT_MS: 3000, BACK_POLL_MS: 200,
         SCAN_AHEAD_PX: 0, SCAN_BEHIND_PX: 0,   // v1.4.0: cuma yang BENERAN di layar
-        SCROLL_REFRESH_AT: 30,  // 30x scroll KOSONG berturut-turut -> hard refresh
         RESTORE_TOLERANCE_PX: 400,   // v1.5.0: selisih dianggap "balik ke atas"
         RESTORE_SETTLE_MS: 600,      // tunggu feed siap sebelum dipulihkan
         PASS_MARGIN_PX: 120          // geser sedikit lewat post yang sudah diproses
@@ -79,6 +91,15 @@
     let statFail = 0;      // gagal tangkap URL / tombol
     let statScroll = 0;    // scroll KOSONG berturut-turut (nol lagi tiap tekan komentar)
     let statTotalScroll = 0;
+    let statCta = 0;       // v2.0.0: berapa iklan yang berhasil diklik
+
+    // v2.0.0 — mode
+    let MODE = 'search';   // v2.1.0: START selalu mulai dari SEARCH
+    let KEYWORDS = [];
+    let KW_IDX = 0;
+    let MODE_LINK = 0;
+    let ANTRIAN = [];      // v2.2.0: antrian keyword yang sudah dikocok
+    let cekConfigTerakhir = 0;   // v2.5.0: kapan config terakhir dicek
 
     // TIDAK ADA saringan sidik jari / nomor post di sisi browser.
     // SEMUA link dikirim ke sheet. Anti-dobel sepenuhnya urusan GAS.
@@ -88,6 +109,47 @@
 
     // ---------- util ----------
     function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    // ============================================================
+    // v2.3.1 — KLIK YANG BENERAN JALAN DI TAMPERMONKEY
+    //
+    // Tampermonkey menjalankan userscript di KOTAK PASIR. `window` di dalam
+    // sini bukan Window asli, cuma bungkusan. Akibatnya:
+    //     new MouseEvent('click', { view: window })
+    // ditolak browser dengan:
+    //     "Failed to convert value to 'Window'"
+    // Kliknya GAGAL TOTAL sebelum sempat kejadian.
+    //
+    // Di console tidak error karena console jalan di halaman langsung,
+    // jadi window-nya asli. Itu sebabnya kelihatan jalan waktu diuji F12
+    // tapi mati begitu dipasang di Tampermonkey.
+    //
+    // Perbaikan: pakai Window asli lewat unsafeWindow, dengan dua cadangan.
+    // ============================================================
+    function windowAsli() {
+        try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow) return unsafeWindow; } catch (e) {}
+        return null;
+    }
+
+    function klikAsli(el) {
+        if (!el) return false;
+        const W = windowAsli();
+        // 1. MouseEvent dengan Window ASLI — paling mirip klik jari
+        if (W && W.MouseEvent) {
+            try {
+                el.dispatchEvent(new W.MouseEvent('click', { bubbles: true, cancelable: true, view: W }));
+                return true;
+            } catch (e) {}
+        }
+        // 2. klik bawaan elemen
+        try { el.click(); return true; } catch (e) {}
+        // 3. MouseEvent tanpa view (view memang boleh dikosongkan)
+        try {
+            el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            return true;
+        } catch (e) {}
+        return false;
+    }
     function rand(a, b) { return Math.floor(Math.random() * (b - a + 1)) + a; }
 
     // buang karakter icon private-use FB (contoh: ikon di "󰍹 176comments")
@@ -139,6 +201,16 @@
 
     function setPhase(p) { phase = p; updateUI(); }
 
+    // v2.3.2: pasang/cabut penanda "bot lagi jalan" di <html>
+    function tandaiJalan() {
+        try {
+            const el = document.documentElement;
+            if (!el) return;
+            if (running && !paused) el.setAttribute(RUN_ATTR, '1');
+            else el.removeAttribute(RUN_ATTR);
+        } catch (e) {}
+    }
+
     // ============================================================
     // CHUNK 2 — KIRIM KE SHEET (GAS nol perubahan)
     // ============================================================
@@ -178,6 +250,23 @@
     }
 
     function getAkunFb() { return (GM_getValue(AKUN_FB_KEY, '') || '').trim(); }
+
+    // v2.0.0: tarik daftar keyword dari TM_Config lewat GAS
+    function ambilKeyword() {
+        return apiCallWithRetry({
+            method: 'POST',
+            url: ENDPOINT_URL,
+            data: JSON.stringify({ action: 'get_scraper_config' }),
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            parse: function (txt) {
+                const r = JSON.parse(txt);
+                if (!r.ok || !r.config) return { ok: false, reason: 'config-kosong' };
+                const kw = r.config.search_keywords || [];
+                const bot = r.config.bot || null;   // v2.4.0: angka-angka dari sheet
+                return { ok: true, keywords: kw, bot: bot };
+            }
+        }, 'Keyword');
+    }
 
     function submitToSheet(url) {
         const raw = getAkunFb();
@@ -295,6 +384,101 @@
             cur = cur.parentElement;
         }
         return null;
+    }
+
+    // ============================================================
+    // v2.0.0 — TOMBOL CTA IKLAN
+    // F12 membuktikan: iklan FB mobile TIDAK punya <a href> sama sekali.
+    // Tombolnya <div data-action-id> berisi teks biasa TANPA aria-label —
+    // makanya pencarian lewat aria-label dulu selalu nihil.
+    // Klik BIASA sudah bikin FB membuka tab baru sendiri; ctrl+klik justru
+    // gagal (tidak ada <a>, halaman malah pindah).
+    // ============================================================
+    // ============================================================
+    // v2.3.0 — SASARAN KLIK IKLAN (hasil uji F12, terbukti)
+    //
+    // Aturan yang menentukan:
+    //   1. Sasaran HARUS di BAWAH ujung foto/video.
+    //      Di atas foto isinya caption, nama pengiklan, judul —
+    //      keklik di situ cuma manjangin caption / buka halaman post.
+    //   2. "Lihat selengkapnya" DITOLAK — itu pemanjang caption.
+    //   3. Angka ("55", "739", "1,8 rb") DITOLAK — itu tombol reaksi.
+    //   4. Iklan kirim pesan TIDAK diklik sama sekali — dia gak buka tab
+    //      baru, malah nyeret bot ke Messenger.
+    // ============================================================
+    const CTA_TEKS = /(pelajariselengkapnya|learnmore|belanjasekarang|shopnow|daftarsekarang|daftar|signup|pesansekarang|ordernow|booknow|unduh|download|install|pasang|bukatautan|beli|checkout|reservasi|gabung|coba|seerates|kunjungisitus|visitsite|mainkan|langganan|isiformulir)/;
+    const CTA_PESAN = /(kirimpesan|sendmessage|message|pesan|whatsapp|kirimwa|hubungikami|hubungi|contactus|callnow|telepon|chat|inbox)/;
+    const CAPTION_TEKS = /^(lihatselengkapnya|selengkapnya|seemore|showmore|lainnya)$/;
+    const ANGKA_TEKS = /^[0-9.,rbjtkm ]*$/;
+
+    function namaPengiklan(post) {
+        try {
+            const btns = post.querySelectorAll('div[role="button"][aria-label]');
+            for (const b of btns) {
+                const t = cleanLabel(b.getAttribute('aria-label'));
+                if (/^Foto profil /i.test(t)) return normText(t.replace(/^Foto profil\s*/i, ''));
+            }
+        } catch (e) {}
+        return '';
+    }
+
+    // ujung bawah foto/video — img/video dulu, blok besar cuma cadangan.
+    // Cadangan HARUS tanpa teks, kalau tidak yang keukur malah blok post
+    // (pernah kejadian: kebaca 617 padahal fotonya berakhir di 442).
+    function ujungBawahFoto(post, mTop) {
+        let bawah = 0;
+        try {
+            post.querySelectorAll('img,video,[data-mcomponent*="Image"],[data-mcomponent*="Video"]').forEach(m => {
+                const r = m.getBoundingClientRect();
+                if (r.width < 150 || r.height < 120) return;
+                const b = r.bottom - mTop;
+                if (b > bawah) bawah = b;
+            });
+        } catch (e) {}
+        if (!bawah) {
+            let kecil = null;
+            try {
+                post.querySelectorAll('[data-action-id]').forEach(el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 200 || r.height < 200 || r.width / r.height > 3) return;
+                    if (cleanLabel(el.innerText).trim()) return;   // ada teks = bukan foto murni
+                    if (!kecil || r.height < kecil.h) kecil = { h: r.height, b: r.bottom - mTop };
+                });
+            } catch (e) {}
+            if (kecil) bawah = kecil.b;
+        }
+        return bawah;
+    }
+
+    // hasil: { el, teks, jenis } — jenis 'cta' | 'teks' | 'pesan' | null
+    function pilihSasaranIklan(post, mTop) {
+        const fotoBawah = ujungBawahFoto(post, mTop);
+        const batas = fotoBawah ? (fotoBawah - 10) : -99999;
+        let cta = null, teks = null, adaPesan = false;
+        try {
+            post.querySelectorAll('[data-action-id]').forEach(el => {
+                const r = el.getBoundingClientRect();
+                const t = cleanLabel(el.innerText).replace(/\s+/g, ' ').trim();
+                const n = normText(t);
+                const j = r.top - mTop;
+                if (!t || r.width < 50 || r.height < 14) return;
+                if (j < batas) return;                       // di atas foto
+                if (CAPTION_TEKS.test(n)) return;            // pemanjang caption
+                if (CTA_PESAN.test(n)) { adaPesan = true; return; }
+                if (ANGKA_TEKS.test(t)) return;              // tombol reaksi
+                if (r.height <= 70 && CTA_TEKS.test(n) && t.length <= 45) {
+                    if (!cta || j < cta.jarak) cta = { el: el, teks: t, jarak: j, jenis: 'cta' };
+                    return;
+                }
+                if (r.height > 200) return;
+                if (r.height > 90 && r.width / r.height < 3) return;
+                if (el.querySelector('img,video')) return;
+                if (!teks || j < teks.jarak) teks = { el: el, teks: t, jarak: j, jenis: 'teks' };
+            });
+        } catch (e) {}
+        if (cta) return cta;
+        if (adaPesan) return { jenis: 'pesan' };
+        return teks;
     }
 
     // ---------- URL ----------
@@ -451,9 +635,29 @@
     async function processPost(post, marker) {
         try { post.setAttribute(DONE_ATTR, '1'); } catch (e) {}
 
+        // v2.3.0: URUTAN BARU — klik iklan DULU, baru komentar.
+        //   jumpa iklan -> klik (tab baru, halaman tetap di FB)
+        //   -> buka komentar -> ambil link -> Kembali -> lanjut scroll
+        if (MODE === 'search') {
+            const mTopKlik = marker ? marker.getBoundingClientRect().top : -99999;
+            const utuh = await klikIklan(post, mTopKlik);
+            if (shouldStop) return;
+            if (!utuh) {
+                // halaman sempat pindah — cari lagi iklan yang sama
+                const adv = namaPengiklan(post);
+                let ulang = null, mkUlang = null;
+                for (const m of findSponsorMarkers()) {
+                    const pp = findPostContainer(m);
+                    if (pp && namaPengiklan(pp) === adv) { ulang = pp; mkUlang = m; break; }
+                }
+                if (!ulang) { addLog('Post: hilang sesudah klik iklan, lewati', 'warning'); statFail++; updateUI(); return; }
+                post = ulang; marker = mkUlang;
+                try { post.setAttribute(DONE_ATTR, '1'); } catch (e) {}
+            }
+            await sleep(500);
+        }
+
         // v1.10.0: tombol paling dekat di bawah "Bersponsor".
-        // Di feed hasilnya sama persis kayak cara lama (container cuma
-        // punya satu tombol). Bedanya kerasa di halaman story.php.
         const btn = pickCommentButtonDekat(post, marker);
         if (!btn) { statFail++; addLog('Post: tombol comments tidak ketemu', 'warning'); updateUI(); return; }
 
@@ -464,6 +668,10 @@
         if (!(await interruptibleSleep(rand(SET.READ_MIN, SET.READ_MAX)))) return;
 
         const before = location.href;
+        // v2.0.0: nama pengiklan dicatat SEBELUM pindah halaman, dipakai buat
+        // nemuin lagi iklan yang sama sesudah tekan Kembali (DOM dibangun ulang
+        // FB, jadi elemen lama sudah tidak dipakai).
+        const advId = namaPengiklan(post);
         // v1.5.0: catat posisi feed + ujung bawah post SEBELUM pindah halaman
         const savedY = window.scrollY;
         try { lastPostBottomAbs = window.scrollY + post.getBoundingClientRect().bottom; }
@@ -518,11 +726,13 @@
 
         if (res.ok && res.status === 'new') {
             statSent++;
+            MODE_LINK++; simpanMode();
             try { post.style.outline = '3px solid #42b72a'; } catch (e) {}
             addLog('OK: baris #' + res.row, 'success');
             toast('OK #' + statSent);
         } else if ((res.ok && res.status === 'duplicate') || (!res.ok && res.reason === 'dedup')) {
             statDup++;
+            MODE_LINK++; simpanMode();
             try { post.style.outline = '3px solid #ff77ff'; } catch (e) {}
             addLog('DUP: sudah ada di sheet (baris #' + (res.row || '?') + ')', 'info');
         } else {
@@ -533,6 +743,216 @@
         updateUI();
         await backToFeed();
         await restoreScroll(savedY);
+
+    }
+
+    // ============================================================
+    // v2.0.0 — MODE
+    //   SEARCH : /search_results/?q={keyword} — ambil link + KLIK iklan (mancing)
+    //   HOME   : feed biasa — ambil link saja, iklan TIDAK diklik
+    // ============================================================
+    function urlSearch(kw) {
+        return location.protocol + '//' + location.hostname
+             + '/search_results/?q=' + encodeURIComponent(kw);
+    }
+    function urlHome() {
+        return location.protocol + '//' + location.hostname + '/';
+    }
+
+    function simpanMode() {
+        try {
+            GM_setValue(MODE_KEY, MODE);
+            GM_setValue(KW_IDX_KEY, String(KW_IDX));
+            GM_setValue(MODE_LINK_KEY, String(MODE_LINK));
+            GM_setValue(KW_LIST_KEY, JSON.stringify(KEYWORDS));
+            GM_setValue(KW_QUEUE_KEY, JSON.stringify(ANTRIAN));
+        } catch (e) {}
+    }
+    function muatMode() {
+        try {
+            MODE = GM_getValue(MODE_KEY, 'search') || 'search';
+            KW_IDX = parseInt(GM_getValue(KW_IDX_KEY, '0'), 10) || 0;
+            MODE_LINK = parseInt(GM_getValue(MODE_LINK_KEY, '0'), 10) || 0;
+            const raw = GM_getValue(KW_LIST_KEY, '');
+            if (raw) { try { KEYWORDS = JSON.parse(raw) || []; } catch (e) { KEYWORDS = []; } }
+            const q = GM_getValue(KW_QUEUE_KEY, '');
+            if (q) { try { ANTRIAN = JSON.parse(q) || []; } catch (e) { ANTRIAN = []; } }
+        } catch (e) {}
+    }
+
+    // pindah mode / keyword: simpan status -> nyalakan auto-resume -> pindah halaman
+    //
+    // v2.4.1: MODE_LINK cuma dinolin waktu GANTI MODE, BUKAN ganti keyword.
+    // Dulu hitungan direset tiap ganti keyword, jadi:
+    //     kw A dapat 4 -> reset 0
+    //     kw B dapat 2 -> reset 0
+    //     kw C dapat 3 -> reset 0
+    // total 9 link tapi yang kecatat cuma 3 — batas 10 gak pernah kesentuh.
+    // Sekarang ditotal lintas keyword: 4+2+3+1 = 10 -> pindah HOME.
+    function pindah(modeBaru, kwIdxBaru, alasan) {
+        const gantiMode = (modeBaru !== MODE);
+        MODE = modeBaru;
+        if (typeof kwIdxBaru === 'number') KW_IDX = kwIdxBaru;
+        if (gantiMode) MODE_LINK = 0;
+        statScroll = 0;
+        const tujuan = (MODE === 'search' && KEYWORDS.length)
+            ? urlSearch(KEYWORDS[KW_IDX % KEYWORDS.length])
+            : urlHome();
+        setHome(tujuan);
+        simpanMode();
+        addLog('PINDAH → ' + MODE.toUpperCase()
+            + (MODE === 'search' && KEYWORDS.length ? ' "' + KEYWORDS[KW_IDX % KEYWORDS.length] + '"' : '')
+            + ' (' + alasan + ')'
+            + (gantiMode ? ' — hitungan link direset'
+                         : ' — hitungan link jalan terus: ' + MODE_LINK), 'detect');
+        try { GM_setValue(AUTO_RESUME_KEY, '1'); } catch (e) {}
+        shouldStop = true;
+        try {
+            if (location.href === tujuan) location.reload();
+            else location.href = tujuan;
+        } catch (e) { location.href = tujuan; }
+    }
+
+    // ============================================================
+    // v2.2.0 — KEYWORD ACAK (bukan urut)
+    // Cara kocok kartu: semua keyword diacak urutannya, dipakai habis satu
+    // per satu, baru dikocok ulang. Kocokan baru tidak pernah dimulai
+    // dengan keyword yang barusan dipakai.
+    // ============================================================
+    function kocok(arr) {
+        const a = arr.slice();
+        for (let i = a.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            const t = a[i]; a[i] = a[j]; a[j] = t;
+        }
+        return a;
+    }
+    function kocokUlang(hindari) {
+        if (KEYWORDS.length <= 1) return KEYWORDS.slice();
+        let a = kocok(KEYWORDS);
+        for (let c = 0; c < 8 && hindari && a[0] === hindari; c++) a = kocok(KEYWORDS);
+        return a;
+    }
+
+    // v2.4.0: angka dari sheet dipasang ke SET.
+    // Nama di sheet -> nama di SET. Kalau barisnya gak ada, angka bawaan dipakai.
+    function terapkanConfigBot(bot) {
+        if (!bot) return 0;
+        const peta = {
+            search_scroll_max: 'SEARCH_SCROLL_MAX',
+            home_scroll_max:   'HOME_SCROLL_MAX',
+            search_link_max:   'SEARCH_TO_HOME',
+            home_link_max:     'HOME_TO_SEARCH',
+            cta_tunggu_ms:     'CTA_WAIT_MS',
+            scroll_jarak_min:  'SCROLL_MIN',
+            scroll_jarak_max:  'SCROLL_MAX',
+            jeda_iklan_min:    'BETWEEN_POSTS_MIN',
+            jeda_iklan_max:    'BETWEEN_POSTS_MAX'
+        };
+        let n = 0;
+        const berubah = [];
+        for (const k in peta) {
+            const v = parseInt(bot[k], 10);
+            if (isNaN(v) || v <= 0) continue;
+            const lama = SET[peta[k]];
+            if (lama !== v) berubah.push(k + ' ' + lama + ' → ' + v);
+            SET[peta[k]] = v;
+            n++;
+        }
+        if (SET.SCROLL_MAX < SET.SCROLL_MIN) SET.SCROLL_MAX = SET.SCROLL_MIN;
+        if (SET.BETWEEN_POSTS_MAX < SET.BETWEEN_POSTS_MIN) SET.BETWEEN_POSTS_MAX = SET.BETWEEN_POSTS_MIN;
+        return { jumlah: n, berubah: berubah };
+    }
+
+    // ============================================================
+    // v2.5.0 — CEK CONFIG BERKALA (60 detik)
+    // Dulu config cuma ditarik waktu START / ganti keyword / ganti mode.
+    // Kalau angka di sheet diubah pas bot lagi asik scroll, dia baru tau
+    // nanti-nanti. Sekarang dicek sendiri tiap 60 detik.
+    //
+    // Catatan: GAS nyimpen config di ingatan sementara 60 detik juga,
+    // jadi paling lambat sekitar 2 menit dari kamu ubah di sheet.
+    // ============================================================
+    async function cekConfigBerkala() {
+        if (Date.now() - cekConfigTerakhir < SET.CEK_CONFIG_MS) return;
+        cekConfigTerakhir = Date.now();
+        let r;
+        try { r = await ambilKeyword(); } catch (e) { return; }
+        if (!r || !r.ok) return;
+
+        if (r.bot) {
+            const hasil = terapkanConfigBot(r.bot);
+            if (hasil.berubah.length) {
+                addLog('Config berubah: ' + hasil.berubah.join(', '), 'detect');
+            }
+        }
+        // keyword ikut disegarkan — kalau kamu tambah di sheet, langsung kebaca
+        if (r.keywords && r.keywords.length) {
+            const lama = KEYWORDS.length;
+            const beda = (lama !== r.keywords.length)
+                || r.keywords.some((k, i) => KEYWORDS[i] !== k);
+            if (beda) {
+                KEYWORDS = r.keywords;
+                ANTRIAN = ANTRIAN.filter(k => KEYWORDS.indexOf(k) !== -1);
+                simpanMode();
+                addLog('Keyword berubah: ' + lama + ' → ' + KEYWORDS.length + ' di sheet', 'detect');
+            }
+        }
+    }
+
+    // batas scroll kosong BEDA per mode
+    function batasScrollKosong() {
+        return (MODE === 'search') ? SET.SEARCH_SCROLL_MAX : SET.HOME_SCROLL_MAX;
+    }
+
+    // v2.1.1: SELALU tarik ulang dari sheet.
+    async function tarikKeywordSegar(kenapa) {
+        setPhase('tarik keyword');
+        const lama = KEYWORDS.length;
+        const r = await ambilKeyword();
+        if (r.ok && r.bot) {
+            const n = terapkanConfigBot(r.bot).jumlah;
+            if (n) addLog('Config: ' + n + ' angka dipasang dari sheet — '
+                + 'scroll kosong S/H ' + SET.SEARCH_SCROLL_MAX + '/' + SET.HOME_SCROLL_MAX
+                + ', link S/H ' + SET.SEARCH_TO_HOME + '/' + SET.HOME_TO_SEARCH, 'success');
+        }
+        if (r.ok && r.keywords && r.keywords.length) {
+            KEYWORDS = r.keywords;
+            simpanMode();
+            addLog('Keyword ' + kenapa + ': ' + KEYWORDS.length + ' dari sheet'
+                + (lama && lama !== KEYWORDS.length ? ' (sebelumnya ' + lama + ')' : '')
+                + ' — ' + KEYWORDS.slice(0, 6).join(', ') + (KEYWORDS.length > 6 ? ', ...' : ''), 'success');
+            return true;
+        }
+        addLog('Keyword ' + kenapa + ': gagal/kosong, pakai simpanan lama (' + lama + ')', 'warning');
+        return KEYWORDS.length > 0;
+    }
+
+    async function keywordBerikutnya(alasan) {
+        const sekarang = KEYWORDS.length ? KEYWORDS[KW_IDX % KEYWORDS.length] : '';
+        await tarikKeywordSegar('refresh');
+        if (!KEYWORDS.length) { pindah('home', 0, 'tidak ada keyword'); return; }
+        ANTRIAN = ANTRIAN.filter(k => KEYWORDS.indexOf(k) !== -1);
+        if (!ANTRIAN.length) {
+            ANTRIAN = kocokUlang(sekarang);
+            addLog('Keyword: kocok ulang — ' + ANTRIAN.slice(0, 6).join(', ') + (ANTRIAN.length > 6 ? ', ...' : ''), 'detect');
+        }
+        const pilih = ANTRIAN.shift();
+        const idx = KEYWORDS.indexOf(pilih);
+        simpanMode();
+        pindah('search', idx < 0 ? 0 : idx, alasan);
+    }
+
+    async function cekGantiMode() {
+        if (MODE === 'search' && MODE_LINK >= SET.SEARCH_TO_HOME) {
+            pindah('home', KW_IDX, MODE_LINK + ' link di search');
+            return true;
+        }
+        if (MODE === 'home' && MODE_LINK >= SET.HOME_TO_SEARCH) {
+            await keywordBerikutnya(MODE_LINK + ' link di home');
+            return true;
+        }
+        return false;
     }
 
     // refresh halaman lalu lanjut sendiri (auto-resume)
@@ -541,12 +961,45 @@
         try { GM_setValue(AUTO_RESUME_KEY, '1'); } catch (e) {}
         shouldStop = true;
         try {
-            // v1.9.0: hard refresh mendarat di HALAMAN AWAL, bukan feed.
-            // Kalau bot dijalanin di /search_results/?q=dewi11, refresh
-            // balik ke situ juga — bukan diseret ke m.facebook.com.
             if (location.href === HOME_URL) location.reload();
             else location.href = HOME_URL;
         } catch (e) { location.href = HOME_URL; }
+    }
+
+    // ============================================================
+    // v2.3.0 — KLIK IKLAN
+    // Dijalankan SEBELUM tekan komentar, selagi DOM masih utuh.
+    // Dulu dijalankan sesudah Kembali, jadi iklannya harus dicari ulang
+    // lewat nama pengiklan — sering gagal karena FB bangun ulang halaman.
+    // Cuma mode SEARCH. Di HOME iklan tidak pernah diklik.
+    // ============================================================
+    async function klikIklan(post, mTop) {
+        const sasaran = pilihSasaranIklan(post, mTop);
+        if (!sasaran) { addLog('Iklan: tidak ada bagian aman diklik, lewati', 'info'); return true; }
+        if (sasaran.jenis === 'pesan') {
+            addLog('Iklan: jenis kirim pesan — TIDAK diklik', 'info');
+            return true;
+        }
+
+        const sebelum = location.href;
+        try { sasaran.el.style.outline = '3px solid #00c2ff'; } catch (e) {}
+        if (!klikAsli(sasaran.el)) {
+            addLog('Iklan: klik GAGAL (semua cara ditolak)', 'error');
+            return true;
+        }
+        addLog('Iklan: klik ' + (sasaran.jenis === 'cta' ? 'CTA' : 'teks')
+            + ' "' + sasaran.teks.substring(0, 30) + '"', 'success');
+
+        if (!(await interruptibleSleep(SET.CTA_WAIT_MS))) return false;
+
+        if (location.href === sebelum) {
+            statCta++;
+            updateUI();
+            return true;      // tab baru kebuka, halaman asal aman
+        }
+        addLog('Iklan: halaman malah pindah — tekan Kembali', 'warning');
+        await backToFeed();
+        return false;         // post lama sudah tidak berlaku
     }
 
     async function scrollStep() {
@@ -576,17 +1029,71 @@
         return out;
     }
 
-    async function mainLoop() {
+    // v2.1.0: balik ke awal — SEARCH, keyword pertama, hitungan mode nol.
+    // Dipanggil saat STOP dan saat START manual. TIDAK dipanggil saat
+    // auto-resume / pindah mode, biar bot lanjut di tempatnya.
+    // START / STOP memang balik ke awal — di sini MODE_LINK sengaja dinolin.
+    function resetMode() {
+        MODE = 'search';
+        MODE_LINK = 0;
+        statScroll = 0;
+        ANTRIAN = [];          // v2.2.0: antrian dikocok ulang saat START
+        KW_IDX = 0;
+        simpanMode();
+    }
+
+    async function mainLoop(isResume) {
         if (running) { addLog('Main: sudah jalan', 'warning'); return; }
         if (!getAkunFb()) { addLog('Main: Akun FB belum diisi', 'error'); return; }
 
         running = true; shouldStop = false; paused = false;
 
-        // v1.10.0: halaman apa pun yang lagi kebuka jadi rumah — termasuk
-        // story.php. Bot dijalanin di mana, di situ dia kerja.
-        setHome(location.href);
+        muatMode();
+        // v2.1.0: START manual selalu mulai dari SEARCH keyword pertama.
+        // Auto-resume tidak direset — dia lanjut di mode & keyword terakhir.
+        if (!isResume) {
+            resetMode();
+            addLog('Main: mulai dari SEARCH keyword pertama', 'info');
+        }
         addLog('Main: START (' + getAkunFb() + ' - v' + TM_VERSION + ')', 'success');
-        addLog('Rumah: ' + HOME_URL.substring(0, 90), 'info');
+
+        // v2.1.1: START manual SELALU tarik ulang dari sheet.
+        // Auto-resume cuma narik kalau simpanannya kosong (biar cepat).
+        cekConfigTerakhir = Date.now();
+        if (!isResume) {
+            await tarikKeywordSegar('START');
+        } else if (!KEYWORDS.length) {
+            await tarikKeywordSegar('resume');
+        }
+        if (!KEYWORDS.length) {
+            MODE = 'home';
+            addLog('Keyword kosong di TM_Config — jalan mode HOME saja', 'warning');
+        } else if (!isResume) {
+            // v2.2.0: START manual mulai dari keyword ACAK, bukan yang pertama
+            ANTRIAN = kocokUlang('');
+            const pilih = ANTRIAN.shift();
+            KW_IDX = Math.max(0, KEYWORDS.indexOf(pilih));
+            addLog('Keyword acak: "' + pilih + '" (antrian ' + (ANTRIAN.length + 1) + ')', 'detect');
+        }
+        simpanMode();
+
+        // pastikan berada di halaman yang sesuai mode
+        const tujuan = (MODE === 'search' && KEYWORDS.length)
+            ? urlSearch(KEYWORDS[KW_IDX % KEYWORDS.length])
+            : urlHome();
+        if (sidikHalaman(location.href) !== sidikHalaman(tujuan)) {
+            addLog('Pindah ke halaman ' + MODE.toUpperCase() + '...', 'info');
+            setHome(tujuan);
+            simpanMode();
+            try { GM_setValue(AUTO_RESUME_KEY, '1'); } catch (e) {}
+            running = false;
+            location.href = tujuan;
+            return;
+        }
+        setHome(location.href);
+        addLog('MODE ' + MODE.toUpperCase()
+            + (MODE === 'search' && KEYWORDS.length ? ' — keyword "' + KEYWORDS[KW_IDX % KEYWORDS.length] + '"' : '')
+            + ' | link mode ini: ' + MODE_LINK, 'detect');
         updateUI();
 
         let stuck = 0;
@@ -622,6 +1129,7 @@
                     if (document.body.contains(p) && p.getAttribute(DONE_ATTR) !== '1') {
                         setPhase('proses');
                         await processPost(p, mk);
+                        if (await cekGantiMode()) return;   // v2.0.0: sudah cukup, pindah
                         if (!(await interruptibleSleep(rand(SET.BETWEEN_POSTS_MIN, SET.BETWEEN_POSTS_MAX)))) break;
 
                         // v1.5.0: geser SECUKUPNYA — cuma sampai post yang barusan
@@ -646,9 +1154,16 @@
                 const moved = await scrollStep();
                 updateUI();
 
-                // pemicu utama: tiap 20x scroll -> refresh, lanjut sendiri
-                if (statScroll >= SET.SCROLL_REFRESH_AT) {
-                    refreshAndResume('sudah ' + statScroll + 'x scroll kosong (tanpa iklan)');
+                // v2.5.0: cek config tiap 60 detik, gak nunggu ganti keyword
+                await cekConfigBerkala();
+                if (shouldStop) break;
+
+                // v2.0.0: scroll kosong -> GANTI KEYWORD (search) / balik search (home).
+                // v2.4.0: batasnya BEDA per mode, diatur dari sheet.
+                if (statScroll >= batasScrollKosong()) {
+                    if (MODE === 'search') await keywordBerikutnya(statScroll + 'x scroll kosong');
+                    else if (KEYWORDS.length) await keywordBerikutnya(statScroll + 'x scroll kosong di home');
+                    else refreshAndResume(statScroll + 'x scroll kosong');
                     return;
                 }
 
@@ -660,7 +1175,9 @@
                         if (!(await interruptibleSleep(2000))) break;
                     }
                     if (stuck >= 6) {
-                        refreshAndResume('scroll mentok 6x');
+                        // v2.0.0: mentok = hasil pencarian habis -> ganti keyword
+                        if (KEYWORDS.length) await keywordBerikutnya('scroll mentok (hasil habis)');
+                        else refreshAndResume('scroll mentok 6x');
                         return;
                     }
                 } else stuck = 0;
@@ -675,10 +1192,19 @@
         }
     }
 
+    // v2.1.0: STOP = berhenti + BALIK KE AWAL.
+    // Nyala lagi nanti mulai dari SEARCH keyword pertama.
+    // Beda dengan PAUSE yang cuma menahan di tempat.
     function stopMainLoop() {
         shouldStop = true; paused = false;
         try { GM_setValue(AUTO_RESUME_KEY, ''); } catch (e) {}
-        addLog('Main: STOP diminta', 'info');
+        resetMode();
+        // v2.1.1: simpanan keyword dibuang, jadi START berikutnya pasti
+        // narik ulang dari sheet — nggak ada sisa daftar lama.
+        KEYWORDS = [];
+        try { GM_setValue(KW_LIST_KEY, ''); } catch (e) {}
+        addLog('Main: STOP — direset ke SEARCH keyword pertama, keyword ditarik ulang saat START', 'warning');
+        updateUI();
     }
 
     function togglePause() {
@@ -725,7 +1251,18 @@
             if (g('fbm-sent')) g('fbm-sent').textContent = statSent;
             if (g('fbm-dup')) g('fbm-dup').textContent = statDup;
             if (g('fbm-fail')) g('fbm-fail').textContent = statFail;
-            if (g('fbm-scroll')) g('fbm-scroll').textContent = statScroll + '/' + SET.SCROLL_REFRESH_AT;
+            if (g('fbm-scroll')) g('fbm-scroll').textContent = statScroll + '/' + batasScrollKosong();
+            if (g('fbm-cta')) g('fbm-cta').textContent = statCta;
+            const md = g('fbm-mode');
+            if (md) {
+                const batas = (MODE === 'search') ? SET.SEARCH_TO_HOME : SET.HOME_TO_SEARCH;
+                const kw = (MODE === 'search' && KEYWORDS.length)
+                    ? ' &middot; "' + escapeHTML(KEYWORDS[KW_IDX % KEYWORDS.length]) + '" (' + (KW_IDX % KEYWORDS.length + 1) + '/' + KEYWORDS.length + ')'
+                    : '';
+                md.innerHTML = '<b>' + MODE.toUpperCase() + '</b>' + kw
+                    + ' &middot; link ' + MODE_LINK + '/' + batas
+                    + (MODE === 'search' ? ' &middot; klik iklan AKTIF' : ' &middot; klik iklan MATI');
+            }
 
             // pil kecil
             if (g('fbm-pill-num')) g('fbm-pill-num').textContent = statSent;
@@ -770,6 +1307,7 @@
                                  : '<span style="color:#F0997B;">belum diisi</span>';
             }
             renderLog();
+            tandaiJalan();   // v2.3.2: penanda buat CMD
         } catch (e) {}
     }
 
@@ -825,7 +1363,9 @@
             + '<div><div id="fbm-dup" style="font-size:20px;font-weight:500;color:#ED93B1;line-height:1;">0</div><div style="font-size:10px;color:#B4B2A9;">dedup</div></div>'
             + '<div><div id="fbm-fail" style="font-size:20px;font-weight:500;color:#F0997B;line-height:1;">0</div><div style="font-size:10px;color:#B4B2A9;">gagal</div></div>'
             + '<div><div id="fbm-scroll" style="font-size:20px;font-weight:500;color:#B4B2A9;line-height:1;">0/30</div><div style="font-size:10px;color:#B4B2A9;">kosong</div></div>'
+            + '<div><div id="fbm-cta" style="font-size:20px;font-weight:500;color:#85B7EB;line-height:1;">0</div><div style="font-size:10px;color:#B4B2A9;">iklan</div></div>'
             + '</div>'
+            + '<div id="fbm-mode" style="font-size:10px;color:#9FE1CB;margin-bottom:8px;line-height:1.5;">-</div>'
 
             + '<div id="fbm-akun-box" style="margin-bottom:8px;">'
             + '<input id="fbm-akun-input" type="text" placeholder="nama anggota, contoh: FEE1">'
@@ -835,9 +1375,12 @@
 
             + '<button id="fbm-start" style="' + btnCss + 'width:100%;background:#0F6E56;margin-bottom:8px;">start</button>'
             + '<div id="fbm-row" style="display:none;gap:6px;margin-bottom:8px;">'
-            + '<button id="fbm-stop" style="' + btnCss + 'background:#993C1D;">stop</button>'
+            + '<button id="fbm-stop" style="' + btnCss + 'background:#993C1D;">stop &amp; reset</button>'
             + '<button id="fbm-pause" style="' + btnCss + 'background:#854F0B;">pause</button></div>'
 
+            + '<div style="display:flex;gap:6px;margin-bottom:8px;">'
+            + '<button id="fbm-ganti" style="' + btnCss + 'background:#185FA5;">ganti keyword</button>'
+            + '<button id="fbm-mode-tukar" style="' + btnCss + 'background:#5C4B8A;">tukar mode</button></div>'
             + '<div style="display:flex;gap:6px;margin-bottom:8px;">'
             + '<button id="fbm-reset" style="' + btnCss + 'background:#444441;">reset hitungan</button></div>'
 
@@ -865,9 +1408,9 @@
                     alert('Nama Akun FB belum diisi!');
                     return;
                 }
-                mainLoop();
+                mainLoop(false);   // v2.1.0: START manual = mulai dari SEARCH
             } else {
-                togglePause();
+                togglePause();     // pause/lanjut — TIDAK mereset apa pun
             }
             updateUI();
         });
@@ -885,12 +1428,29 @@
             if (running) return;
             if (!getAkunFb()) { alert('Nama Akun FB belum diisi!'); return; }
             setPanelOpen(false); applyPanelState();
-            mainLoop();
+            mainLoop(false);   // v2.1.0: START manual = mulai dari SEARCH
         });
         document.getElementById('fbm-stop').addEventListener('click', () => stopMainLoop());
         document.getElementById('fbm-pause').addEventListener('click', () => togglePause());
+        document.getElementById('fbm-ganti').addEventListener('click', async () => {
+            // v2.1.1: tarik ulang dari sheet dulu, baru maju ke keyword berikutnya
+            const b = document.getElementById('fbm-ganti');
+            b.textContent = 'menarik...'; b.disabled = true;
+            try { await keywordBerikutnya('diminta manual'); }
+            catch (e) { addLog('Ganti keyword gagal: ' + e.message, 'error'); }
+            b.textContent = 'ganti keyword'; b.disabled = false;
+        });
+        document.getElementById('fbm-mode-tukar').addEventListener('click', async () => {
+            if (MODE === 'search') { pindah('home', KW_IDX, 'diminta manual'); return; }
+            const b = document.getElementById('fbm-mode-tukar');
+            b.textContent = 'menarik...'; b.disabled = true;
+            await tarikKeywordSegar('tukar mode');
+            b.textContent = 'tukar mode'; b.disabled = false;
+            if (!KEYWORDS.length) { alert('Belum ada keyword di TM_Config'); return; }
+            pindah('search', 0, 'diminta manual');
+        });
         document.getElementById('fbm-reset').addEventListener('click', () => {
-            statSent = 0; statDup = 0; statFail = 0; statScroll = 0; statTotalScroll = 0;
+            statSent = 0; statDup = 0; statFail = 0; statScroll = 0; statTotalScroll = 0; statCta = 0;
             logs = [];
             document.querySelectorAll('[' + DONE_ATTR + ']').forEach(el => {
                 el.removeAttribute(DONE_ATTR);
@@ -901,6 +1461,9 @@
         });
 
         applyPanelState();
+        // v2.3.2: FB sering bangun ulang halaman, penanda bisa kehapus —
+        // dipasang ulang tiap 2 detik biar CMD gak salah baca.
+        setInterval(() => { try { tandaiJalan(); } catch (e) {} }, 2000);
         setInterval(() => { try { updateUI(); } catch (e) {} }, 15000);
         updateUI();
         addLog('Siap. Isi Akun FB lalu start.', 'success');
@@ -914,6 +1477,7 @@
         try {
             const host = location.hostname;
             if (host !== 'm.facebook.com' && host !== 'www.facebook.com' && host !== 'web.facebook.com') return;
+            muatMode();
             createPanel();
             const resume = GM_getValue(AUTO_RESUME_KEY, '');
             if (resume === '1') {
@@ -923,7 +1487,7 @@
                 const rumah = GM_getValue(HOME_KEY, '');
                 if (rumah) setHome(rumah);
                 addLog('Auto-resume setelah muat ulang...', 'info');
-                setTimeout(() => { if (!running && getAkunFb()) mainLoop(); }, 6000);
+                setTimeout(() => { if (!running && getAkunFb()) mainLoop(true); }, 6000);
             }
         } catch (e) { try { console.error('[FBM] boot: ' + e.message); } catch (err) {} }
     }
