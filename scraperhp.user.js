@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FB Mobile Ads Scraper (BASIC)
 // @namespace    https://riko.local/fbmobile
-// @version      2.5.0
+// @version      2.6.1
 // @description  v2: dua mode SEARCH & HOME. Di SEARCH: ambil link + klik CTA iklan (mancing). Di HOME: ambil link saja. Keyword dari TM_Config. Tab iklan diurus browser_scraper.js.
 // @author       Riko
 // @match        *://m.facebook.com/*
@@ -27,7 +27,7 @@
     const ENDPOINT_URL = 'https://script.google.com/macros/s/AKfycbxe3mCNLCDfmEEwHpi4EKEAVTrAyoAewPIakY4F3ZQ0qNVhr3PBWWOfx5vNWLQ76YQGKQ/exec';
 
     const TM_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
-        ? GM_info.script.version : '2.5.0';
+        ? GM_info.script.version : '2.6.1';
 
     const AKUN_FB_KEY     = 'fbm_akun_fb_v1';
     const AUTO_RESUME_KEY = 'fbm_auto_resume_v1';
@@ -897,6 +897,12 @@
                 simpanMode();
                 addLog('Keyword berubah: ' + lama + ' → ' + KEYWORDS.length + ' di sheet', 'detect');
             }
+            // v2.6.0 — POIN 2: kalau tadi terpaksa HOME gara-gara keyword kosong,
+            // begitu keyword kebaca, balik ke SEARCH. Jangan nyangkut di HOME.
+            if (MODE === 'home' && lama === 0 && KEYWORDS.length > 0) {
+                await keywordBerikutnya('keyword sudah kebaca, balik ke SEARCH');
+                return;
+            }
         }
     }
 
@@ -1065,9 +1071,22 @@
         } else if (!KEYWORDS.length) {
             await tarikKeywordSegar('resume');
         }
+        // v2.6.0 — POIN 2: START WAJIB mulai dari SEARCH.
+        // Dulu kalau tarikan keyword gagal sekali (GAS lemot / belum deploy),
+        // bot langsung banting setir ke HOME dan gak pernah nyoba lagi sampai
+        // ganti mode. Sekarang dicoba 3x dulu; kalau tetap kosong baru HOME,
+        // dan pengecekan 60 detik nanti bakal narik dia balik ke SEARCH.
+        if (!KEYWORDS.length && !isResume) {
+            for (let coba = 2; coba <= 3 && !KEYWORDS.length; coba++) {
+                addLog('Keyword kosong — coba tarik lagi (' + coba + '/3)', 'warning');
+                if (!(await interruptibleSleep(2500))) { running = false; return; }
+                await tarikKeywordSegar('START ulang ' + coba);
+            }
+        }
         if (!KEYWORDS.length) {
             MODE = 'home';
-            addLog('Keyword kosong di TM_Config — jalan mode HOME saja', 'warning');
+            addLog('Keyword tetap kosong sesudah 3x — jalan mode HOME dulu, '
+                 + 'nanti balik SEARCH sendiri kalau keyword sudah kebaca', 'warning');
         } else if (!isResume) {
             // v2.2.0: START manual mulai dari keyword ACAK, bukan yang pertama
             ANTRIAN = kocokUlang('');
@@ -1265,17 +1284,33 @@
             }
 
             // pil kecil
-            if (g('fbm-pill-num')) g('fbm-pill-num').textContent = statSent;
+            // v2.6.1 — POIN 1: angka pil = link dalam SATU MODE.
+            // Dulu pakai statSent (jumlah kiriman sesi ini). statSent cuma ada
+            // di ingatan, gak disimpan — tiap ganti keyword halaman dimuat ulang
+            // dan angkanya balik 0, padahal modenya belum ganti.
+            // MODE_LINK disimpan, jadi selamat lewat ganti keyword & refresh.
+            if (g('fbm-pill-num')) g('fbm-pill-num').textContent = MODE_LINK;
 
-            // v1.11.0: ikon = AKSI kalau ditekan, bukan keadaan sekarang.
-            //   lagi jalan  -> tampil PAUSE (dua garis)
-            //   idle/pause  -> tampil PLAY (segitiga)
-            const ikon = g('fbm-icon-path');
-            if (ikon) {
-                const lagiJalan = running && !paused;
-                ikon.setAttribute('d', lagiJalan
-                    ? 'M1.5 1 H4 V11 H1.5 Z M7 1 H9.5 V11 H7 Z'   // pause
-                    : 'M1 1 L10 6 L1 11 Z');                       // play
+            // v2.6.0 — POIN 1
+            // Bagian tengah: START (segitiga) kalau idle, STOP (kotak) kalau jalan.
+            // Bagian PAUSE cuma muncul kalau lagi jalan; ikonnya PAUSE (dua garis)
+            // waktu berjalan, dan RESUME (segitiga) waktu ditahan.
+            const ikonStop = g('fbm-icon-stop');
+            const segStop = g('fbm-pill-stop');
+            const segPlay = g('fbm-pill-play');
+            const ikonPlay = g('fbm-icon-path');
+            if (ikonStop && segStop) {
+                ikonStop.setAttribute('d', running
+                    ? 'M1.5 1.5 H9.5 V10.5 H1.5 Z'   // stop = kotak
+                    : 'M1 1 L10 6 L1 11 Z');          // start = segitiga
+                segStop.title = running ? 'stop & reset' : 'start';
+            }
+            if (segPlay && ikonPlay) {
+                segPlay.style.display = running ? 'flex' : 'none';
+                ikonPlay.setAttribute('d', paused
+                    ? 'M1 1 L10 6 L1 11 Z'                        // resume
+                    : 'M1.5 1 H4 V11 H1.5 Z M7 1 H9.5 V11 H7 Z'); // pause
+                segPlay.title = paused ? 'resume' : 'pause';
             }
             const pil = g('fbm-pill');
             if (pil) {
@@ -1334,6 +1369,7 @@
             + '#fbm-pill .seg{display:flex;align-items:center;justify-content:center;cursor:pointer;}'
             + '#fbm-pill .seg:active{background:rgba(0,0,0,.22);}'
             + '#fbm-pill-num{padding:6px 10px 6px 12px;font-size:13px;font-weight:500;min-width:26px;}'
+            + '#fbm-pill-stop{padding:6px 9px;border-left:1px solid rgba(255,255,255,.22);}'
             + '#fbm-pill-play{padding:6px 9px;border-left:1px solid rgba(255,255,255,.22);}'
             + '#fbm-pill-open{padding:6px 10px 6px 9px;border-left:1px solid rgba(255,255,255,.22);}'
             + '#fbm-body{pointer-events:auto;display:none;background:rgba(23,26,28,.88);border-radius:10px;padding:9px 11px;color:#fff;}'
@@ -1343,11 +1379,18 @@
             // v1.11.0: pil isinya 3 bagian —
             //   [jumlah kirim] [play/pause] [panah buka panel]
             // Dulu cuma titik + angka, dan buat pause harus buka panel dulu.
+            // v2.6.0 — POIN 1
+            //   belum jalan : [angka] [START] [panah]
+            //   sudah jalan : [angka] [STOP] [PAUSE] [panah]
+            //   STOP nempatin posisi START, PAUSE nongol di sebelahnya.
             + '<div id="fbm-pill">'
             + '<span class="seg" id="fbm-pill-num">0</span>'
-            + '<span class="seg" id="fbm-pill-play" title="start / pause">'
-            + '<svg id="fbm-pill-icon" width="11" height="12" viewBox="0 0 11 12" fill="#fff" aria-hidden="true">'
-            + '<path id="fbm-icon-path" d="M1 1 L10 6 L1 11 Z"/></svg></span>'
+            + '<span class="seg" id="fbm-pill-stop" title="start">'
+            + '<svg width="11" height="12" viewBox="0 0 11 12" fill="#fff" aria-hidden="true">'
+            + '<path id="fbm-icon-stop" d="M1 1 L10 6 L1 11 Z"/></svg></span>'
+            + '<span class="seg" id="fbm-pill-play" title="pause" style="display:none;">'
+            + '<svg width="11" height="12" viewBox="0 0 11 12" fill="#fff" aria-hidden="true">'
+            + '<path id="fbm-icon-path" d="M1.5 1 H4 V11 H1.5 Z M7 1 H9.5 V11 H7 Z"/></svg></span>'
             + '<span class="seg" id="fbm-pill-open" title="buka panel">'
             + '<svg width="11" height="11" viewBox="0 0 11 11" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
             + '<path d="M2 6.8 L5.5 3.3 L9 6.8"/></svg></span>'
@@ -1399,8 +1442,8 @@
             e.stopPropagation();
             setPanelOpen(true); applyPanelState(); updateUI();
         });
-        // play/pause langsung dari pil, gak perlu buka panel
-        document.getElementById('fbm-pill-play').addEventListener('click', (e) => {
+        // v2.6.0 — bagian tengah: START kalau idle, STOP kalau jalan
+        document.getElementById('fbm-pill-stop').addEventListener('click', (e) => {
             e.stopPropagation();
             if (!running) {
                 if (!getAkunFb()) {
@@ -1408,10 +1451,18 @@
                     alert('Nama Akun FB belum diisi!');
                     return;
                 }
-                mainLoop(false);   // v2.1.0: START manual = mulai dari SEARCH
+                mainLoop(false);   // START selalu mulai dari SEARCH
             } else {
-                togglePause();     // pause/lanjut — TIDAK mereset apa pun
+                stopMainLoop();    // STOP = berhenti + reset
             }
+            updateUI();
+        });
+
+        // v2.6.0 — PAUSE / RESUME. Tidak mereset apa pun.
+        document.getElementById('fbm-pill-play').addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (!running) return;
+            togglePause();
             updateUI();
         });
         document.getElementById('fbm-close').addEventListener('click', () => { setPanelOpen(false); applyPanelState(); });
