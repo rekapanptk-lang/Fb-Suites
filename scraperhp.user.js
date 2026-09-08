@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FB Mobile Ads Scraper (BASIC)
 // @namespace    https://riko.local/fbmobile
-// @version      2.6.1
+// @version      2.7.0
 // @description  v2: dua mode SEARCH & HOME. Di SEARCH: ambil link + klik CTA iklan (mancing). Di HOME: ambil link saja. Keyword dari TM_Config. Tab iklan diurus browser_scraper.js.
 // @author       Riko
 // @match        *://m.facebook.com/*
@@ -27,7 +27,7 @@
     const ENDPOINT_URL = 'https://script.google.com/macros/s/AKfycbxe3mCNLCDfmEEwHpi4EKEAVTrAyoAewPIakY4F3ZQ0qNVhr3PBWWOfx5vNWLQ76YQGKQ/exec';
 
     const TM_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
-        ? GM_info.script.version : '2.6.1';
+        ? GM_info.script.version : '2.7.0';
 
     const AKUN_FB_KEY     = 'fbm_akun_fb_v1';
     const AUTO_RESUME_KEY = 'fbm_auto_resume_v1';
@@ -298,15 +298,31 @@
     // ============================================================
 
     // marker iklan: <span class="f5">Bersponsor</span>
-    function isSponsorSpan(sp) {
+    // v2.7.0: FB Inggris nulis "Ad", bukan "Sponsored".
+    // "ad" itu kata pendek — kalau dicari di SEMUA span bisa salah tangkap
+    // (misal potongan teks lain yang kebetulan berbunyi "ad"). Jadi:
+    //   - kata panjang  -> boleh dicari di span mana pun
+    //   - kata pendek   -> HANYA diterima di span.f5, kelas yang FB pakai
+    //                      buat penanda iklan (terbukti dari F12)
+    const PENANDA_PANJANG = ['bersponsor', 'sponsored', 'disponsori', 'bersponsorkan'];
+    const PENANDA_PENDEK  = ['ad', 'ads', 'iklan'];
+
+    function isSponsorSpan(sp, bolehPendek) {
         if (!sp || sp.children.length) return false;
         const n = normText(sp.textContent);
-        return n === 'bersponsor' || n === 'sponsored' || n === 'disponsori';
+        if (!n || n.length > 14) return false;
+        if (PENANDA_PANJANG.indexOf(n) !== -1) return true;
+        if (bolehPendek && PENANDA_PENDEK.indexOf(n) !== -1) return true;
+        return false;
     }
 
     function findSponsorMarkers() {
-        let list = Array.from(document.querySelectorAll('span.f5')).filter(isSponsorSpan);
-        if (list.length === 0) list = Array.from(document.querySelectorAll('span')).filter(isSponsorSpan);
+        // pass 1: span.f5 — kata pendek ("Ad") diterima di sini
+        let list = Array.from(document.querySelectorAll('span.f5')).filter(sp => isSponsorSpan(sp, true));
+        // pass 2: semua span — cuma kata panjang, biar gak salah tangkap
+        if (list.length === 0) {
+            list = Array.from(document.querySelectorAll('span')).filter(sp => isSponsorSpan(sp, false));
+        }
         // v1.4.0: HANYA marker yang beneran kelihatan di layar.
         // Dulu ambil sampai 900px di bawah layar -> bot lompat ke iklan
         // yang belum kelihatan, layar keloncat-loncat.
