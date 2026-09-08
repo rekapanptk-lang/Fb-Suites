@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FB Mobile Ads Scraper (BASIC)
 // @namespace    https://riko.local/fbmobile
-// @version      2.7.0
+// @version      2.9.0
 // @description  v2: dua mode SEARCH & HOME. Di SEARCH: ambil link + klik CTA iklan (mancing). Di HOME: ambil link saja. Keyword dari TM_Config. Tab iklan diurus browser_scraper.js.
 // @author       Riko
 // @match        *://m.facebook.com/*
@@ -27,7 +27,7 @@
     const ENDPOINT_URL = 'https://script.google.com/macros/s/AKfycbxe3mCNLCDfmEEwHpi4EKEAVTrAyoAewPIakY4F3ZQ0qNVhr3PBWWOfx5vNWLQ76YQGKQ/exec';
 
     const TM_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
-        ? GM_info.script.version : '2.7.0';
+        ? GM_info.script.version : '2.9.0';
 
     const AKUN_FB_KEY     = 'fbm_akun_fb_v1';
     const AUTO_RESUME_KEY = 'fbm_auto_resume_v1';
@@ -39,6 +39,17 @@
     const KW_IDX_KEY      = 'fbm_kw_idx_v2';      // keyword ke berapa
     const MODE_LINK_KEY   = 'fbm_mode_link_v2';   // link kekumpul di mode ini
     const KW_QUEUE_KEY    = 'fbm_kw_queue_v2';    // antrian keyword hasil kocokan
+
+    // ============================================================
+    // v2.8.0 — PENJAGA (biar bot gak bisa mati diam-diam)
+    // AKTIF_KEY = niat kamu. Dipasang waktu START, dicabut CUMA waktu STOP.
+    // Beda dengan AUTO_RESUME yang sekali pakai lalu hilang — itu celahnya:
+    // kalau halaman muat ulang dua kali beruntun, penandanya keburu habis
+    // dan bot diam selamanya.
+    // ============================================================
+    const AKTIF_KEY       = 'fbm_aktif_v3';     // '' belum pernah | '1' jalan | '0' di-STOP
+    const PAUSE_KEY       = 'fbm_pause_v3';     // '1' = ditahan, jangan dibangunin
+    const HEARTBEAT_KEY   = 'fbm_hb_v3';        // detak terakhir bot
     const DONE_ATTR       = 'data-fbm-done';
     // v2.3.2: penanda buat browser_scraper.js. Dia di LUAR halaman, gak bisa
     // baca GM_getValue, tapi bisa baca atribut di <html>. Selama tanda ini
@@ -72,7 +83,32 @@
         SCAN_AHEAD_PX: 0, SCAN_BEHIND_PX: 0,   // v1.4.0: cuma yang BENERAN di layar
         RESTORE_TOLERANCE_PX: 400,   // v1.5.0: selisih dianggap "balik ke atas"
         RESTORE_SETTLE_MS: 600,      // tunggu feed siap sebelum dipulihkan
-        PASS_MARGIN_PX: 120          // geser sedikit lewat post yang sudah diproses
+        PASS_MARGIN_PX: 120,         // geser sedikit lewat post yang sudah diproses
+
+        // ============================================================
+        // v2.8.0 — DIPULIHKAN. Enam baris di bawah ini sempat HILANG dari
+        // SET waktu penyuntingan versi lalu, padahal dipakai di banyak
+        // tempat. Akibatnya diam-diam:
+        //   CEK_CONFIG_MS kosong  -> config ditarik TIAP putaran scroll,
+        //                            bukan tiap 60 detik. GAS dihajar terus.
+        //   SEARCH_TO_HOME kosong -> kalau config gagal ditarik, bot GAK
+        //                            PERNAH pindah mode.
+        //   SEARCH_SCROLL_MAX ..  -> gak pernah ganti keyword.
+        //   CTA_WAIT_MS kosong    -> gak nunggu sesudah klik iklan.
+        // Nilai di bawah cuma cadangan; sheet TM_Config tetap yang menang.
+        // ============================================================
+        SEARCH_SCROLL_MAX: 30,  // scroll kosong di SEARCH -> ganti keyword
+        HOME_SCROLL_MAX: 30,    // scroll kosong di HOME   -> balik SEARCH
+        SEARCH_TO_HOME: 10,     // link di SEARCH -> pindah HOME
+        HOME_TO_SEARCH: 30,     // link di HOME   -> balik SEARCH
+        CTA_WAIT_MS: 2500,      // tunggu sesudah klik iklan
+        CTA_MAX_JARAK: 2500,    // batas jarak sasaran dari marker (tidak dari sheet)
+        CEK_CONFIG_MS: 60000,   // cek ulang config sheet tiap 60 detik
+
+        // v2.8.0 — penjaga
+        WATCHDOG_MS: 5000,      // seberapa sering bot diperiksa
+        HB_STALE_MS: 60000,     // gak ada detak selama ini -> dianggap macet
+        RESTART_JEDA_MS: 15000  // jarak minimum antar hidup-ulang
     };
 
     const API_RETRY_MAX = 3;
@@ -100,6 +136,7 @@
     let MODE_LINK = 0;
     let ANTRIAN = [];      // v2.2.0: antrian keyword yang sudah dikocok
     let cekConfigTerakhir = 0;   // v2.5.0: kapan config terakhir dicek
+    let restartTerakhir = 0;     // v2.8.0: kapan penjaga terakhir menghidupkan
 
     // TIDAK ADA saringan sidik jari / nomor post di sisi browser.
     // SEMUA link dikirim ke sheet. Anti-dobel sepenuhnya urusan GAS.
@@ -200,6 +237,27 @@
     }
 
     function setPhase(p) { phase = p; updateUI(); }
+
+    // ---------- v2.8.0: niat, tahan, detak ----------
+    // v2.9.0: niat punya TIGA keadaan
+    //   ''  = belum pernah disentuh -> boleh jalan sendiri kalau nama sudah diisi
+    //   '1' = lagi jalan
+    //   '0' = kamu tekan STOP       -> JANGAN jalan sendiri
+    function setAktif(v) { try { GM_setValue(AKTIF_KEY, v ? '1' : '0'); } catch (e) {} }
+    function isAktif()   { try { return GM_getValue(AKTIF_KEY, '') === '1'; } catch (e) { return false; } }
+    function belumPernah() { try { return GM_getValue(AKTIF_KEY, '') === ''; } catch (e) { return false; } }
+
+    // Syarat jalan sendiri: nama akun sudah diisi, tidak sedang ditahan,
+    // dan kamu belum pernah menekan STOP.
+    function bolehJalanSendiri() {
+        if (!getAkunFb()) return false;
+        if (isPauseTersimpan()) return false;
+        return isAktif() || belumPernah();
+    }
+    function setPauseTersimpan(v) { try { GM_setValue(PAUSE_KEY, v ? '1' : ''); } catch (e) {} }
+    function isPauseTersimpan()   { try { return GM_getValue(PAUSE_KEY, '') === '1'; } catch (e) { return false; } }
+    function detak() { try { GM_setValue(HEARTBEAT_KEY, String(Date.now())); } catch (e) {} }
+    function detakTerakhir() { try { return parseInt(GM_getValue(HEARTBEAT_KEY, '0'), 10) || 0; } catch (e) { return 0; } }
 
     // v2.3.2: pasang/cabut penanda "bot lagi jalan" di <html>
     function tandaiJalan() {
@@ -1069,8 +1127,16 @@
         if (!getAkunFb()) { addLog('Main: Akun FB belum diisi', 'error'); return; }
 
         running = true; shouldStop = false; paused = false;
+        setAktif(true);            // v2.8.0: niat kamu, cuma dicabut waktu STOP
+        setPauseTersimpan(false);
+        detak();
 
         muatMode();
+        // v2.8.0: kalau tadi ditahan lalu halaman muat ulang, tetap ditahan
+        if (isResume && isPauseTersimpan()) {
+            paused = true;
+            addLog('Lanjut dalam keadaan PAUSE (sesuai sebelumnya)', 'info');
+        }
         // v2.1.0: START manual selalu mulai dari SEARCH keyword pertama.
         // Auto-resume tidak direset — dia lanjut di mode & keyword terakhir.
         if (!isResume) {
@@ -1136,6 +1202,7 @@
             if (!isOnFeed()) await backToFeed();
 
             while (!shouldStop) {
+                detak();                       // v2.8.0: tanda bot masih hidup
                 if (!(await waitPause())) break;
 
                 if (!isOnFeed()) {
@@ -1218,7 +1285,9 @@
                 } else stuck = 0;
             }
         } catch (e) {
-            addLog('Main: error: ' + e.message, 'error');
+            // v2.8.0: error gak lagi mematikan bot selamanya —
+            // penjaga bakal menghidupkan lagi dalam beberapa detik.
+            addLog('Main: error: ' + e.message + ' — penjaga akan menghidupkan ulang', 'error');
         } finally {
             running = false; paused = false;
             setPhase('idle');
@@ -1227,11 +1296,64 @@
         }
     }
 
+    // ============================================================
+    // v2.8.0 — PENJAGA
+    // Menutup lima celah yang bikin bot mati diam-diam:
+    //   1. error tak terduga -> dulu cuma nulis log lalu berhenti selamanya
+    //   2. FB pindah halaman sendiri -> penanda lanjut gak sempat dipasang
+    //   3. penanda lanjut sekali-pakai -> habis kalau muat ulang dua kali
+    //   4. panel dihapus FB -> gak bisa dipencet lagi
+    //   5. bot nyangkut tanpa error -> gak ada yang tahu
+    //
+    // Penjaga jalan terus sejak halaman dimuat, TIDAK peduli bot lagi jalan
+    // atau tidak. Yang dia baca cuma niat kamu (AKTIF_KEY), yang cuma bisa
+    // dicabut lewat tombol STOP.
+    // ============================================================
+    function mulaiPenjaga() {
+        setInterval(() => {
+            try {
+                // v2.9.0: jalan sendiri kalau nama sudah diisi, KECUALI
+                // lagi ditahan (PAUSE) atau kamu sudah menekan STOP.
+                if (!bolehJalanSendiri()) return;
+
+                // celah 4: panel dihapus FB -> bikin lagi
+                if (!document.getElementById('fbm-wrap')) {
+                    createPanel();
+                    addLog('Penjaga: panel hilang, dibuat ulang', 'warning');
+                }
+
+                if (running) {
+                    // celah 5: jalan tapi nyangkut (gak ada detak)
+                    const diam = Date.now() - detakTerakhir();
+                    if (diam > SET.HB_STALE_MS && Date.now() - restartTerakhir > SET.RESTART_JEDA_MS) {
+                        restartTerakhir = Date.now();
+                        addLog('Penjaga: bot diam ' + Math.round(diam / 1000) + 's — dihidupkan ulang', 'warning');
+                        shouldStop = true;
+                        running = false;
+                        setTimeout(() => { if (!running) mainLoop(true); }, 2000);
+                    }
+                    return;
+                }
+
+                // celah 1, 2, 3: bot mati padahal niatnya jalan
+                if (Date.now() - restartTerakhir < SET.RESTART_JEDA_MS) return;
+                restartTerakhir = Date.now();
+                addLog(belumPernah()
+                    ? 'Penjaga: nama akun sudah ada — bot dijalankan sendiri'
+                    : 'Penjaga: bot mati, dihidupkan ulang', 'warning');
+                setAktif(true);
+                mainLoop(true);
+            } catch (e) {}
+        }, SET.WATCHDOG_MS);
+    }
+
     // v2.1.0: STOP = berhenti + BALIK KE AWAL.
     // Nyala lagi nanti mulai dari SEARCH keyword pertama.
     // Beda dengan PAUSE yang cuma menahan di tempat.
     function stopMainLoop() {
         shouldStop = true; paused = false;
+        setAktif(false);                // v2.8.0: niat dicabut — penjaga berhenti
+        setPauseTersimpan(false);
         try { GM_setValue(AUTO_RESUME_KEY, ''); } catch (e) {}
         resetMode();
         // v2.1.1: simpanan keyword dibuang, jadi START berikutnya pasti
@@ -1245,6 +1367,7 @@
     function togglePause() {
         if (!running) return;
         paused = !paused;
+        setPauseTersimpan(paused);      // v2.8.0: bertahan lewat muat ulang
         addLog(paused ? 'Main: PAUSE' : 'Main: LANJUT', paused ? 'warning' : 'success');
         updateUI();
     }
@@ -1467,9 +1590,10 @@
                     alert('Nama Akun FB belum diisi!');
                     return;
                 }
-                mainLoop(false);   // START selalu mulai dari SEARCH
+                setAktif(true);            // v2.8.0
+                mainLoop(false);           // START selalu mulai dari SEARCH
             } else {
-                stopMainLoop();    // STOP = berhenti + reset
+                stopMainLoop();            // STOP = berhenti + reset + cabut niat
             }
             updateUI();
         });
@@ -1489,12 +1613,18 @@
             GM_setValue(AKUN_FB_KEY, inp.value.trim());
             addLog('Akun FB disimpan: ' + inp.value.trim(), 'success');
             updateUI();
+            // v2.9.0: begitu nama diisi, bot langsung jalan sendiri
+            if (!running && bolehJalanSendiri()) {
+                setPanelOpen(false); applyPanelState();
+                setAktif(true); mainLoop(false);
+            }
         });
 
         document.getElementById('fbm-start').addEventListener('click', () => {
             if (running) return;
             if (!getAkunFb()) { alert('Nama Akun FB belum diisi!'); return; }
             setPanelOpen(false); applyPanelState();
+            setAktif(true);    // v2.8.0
             mainLoop(false);   // v2.1.0: START manual = mulai dari SEARCH
         });
         document.getElementById('fbm-stop').addEventListener('click', () => stopMainLoop());
@@ -1546,15 +1676,26 @@
             if (host !== 'm.facebook.com' && host !== 'www.facebook.com' && host !== 'web.facebook.com') return;
             muatMode();
             createPanel();
-            const resume = GM_getValue(AUTO_RESUME_KEY, '');
-            if (resume === '1') {
-                GM_setValue(AUTO_RESUME_KEY, '');
-                // v1.9.0: rumah dipulihkan, jadi habis refresh bot lanjut di
-                // halaman yang sama (mis. hasil pencarian), bukan pindah feed.
-                const rumah = GM_getValue(HOME_KEY, '');
-                if (rumah) setHome(rumah);
-                addLog('Auto-resume setelah muat ulang...', 'info');
-                setTimeout(() => { if (!running && getAkunFb()) mainLoop(true); }, 6000);
+            // v2.8.0: yang menentukan lanjut atau tidak adalah NIAT (AKTIF_KEY),
+            // bukan penanda sekali-pakai. Dulu penanda dihapus 6 detik sebelum
+            // bot mulai — kalau halaman muat ulang lagi di sela itu, penandanya
+            // sudah habis dan bot diam selamanya. Itu salah satu celahnya.
+            const rumah = GM_getValue(HOME_KEY, '');
+            if (rumah) setHome(rumah);
+            try { GM_setValue(AUTO_RESUME_KEY, ''); } catch (e) {}
+
+            mulaiPenjaga();   // penjaga jalan terus, apa pun keadaannya
+
+            // v2.9.0: nama akun sudah diisi -> jalan sendiri, gak perlu
+            // ditekan START tiap kali browser dibuka. Kecuali di-PAUSE
+            // atau kamu sudah menekan STOP.
+            if (bolehJalanSendiri()) {
+                const pertama = belumPernah();
+                addLog(pertama ? 'Nama akun sudah ada — bot mulai sendiri...'
+                               : 'Lanjut otomatis sesudah halaman dimuat...', 'info');
+                setTimeout(() => {
+                    if (!running && bolehJalanSendiri()) { setAktif(true); mainLoop(!pertama); }
+                }, 5000);
             }
         } catch (e) { try { console.error('[FBM] boot: ' + e.message); } catch (err) {} }
     }
